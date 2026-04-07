@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 REGION = "Western"
 POU    = "Pune"
-COURSE = "AICITSS - Advanced Information Technology"
+COURSE = "Advanced (ICITSS) MCS Course"
 
 # To monitor multiple combinations, add more dicts to this list:
 # WATCHLIST = [
