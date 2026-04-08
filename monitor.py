@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 REGION = "Western"
 POU    = "Pune"
-COURSE = "Advanced (ICITSS) MCS Course"
+COURSE = "AICITSS - Advanced Information Technology"
 
 # To monitor multiple combinations, add more dicts to this list:
 # WATCHLIST = [
@@ -86,8 +86,10 @@ def run_monitor():
             batches = scrape_batches(region, pou, course)
         except Exception as e:
             logger.error(f"Scrape failed for {key}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             any_error = True
-            continue
+            continue  # Don't crash — log and move to next item
 
         new_hash = compute_hash(batches)
         old_entry = full_state.get(key, {})
