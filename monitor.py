@@ -98,7 +98,19 @@ def run_monitor():
         changed   = new_hash != old_hash
         is_first  = old_hash == ""
 
-        if changed and not is_first:
+        if is_first and batches:
+            logger.info(f"🔔 FIRST RUN — {len(batches)} batch(es) already listed, sending alert")
+            try:
+                send_alert(batches, region, pou, course)
+                alerts_sent += 1
+            except Exception as e:
+                logger.error(f"Failed to send alert: {e}")
+                any_error = True
+
+        elif is_first and not batches:
+            logger.info(f"📋 First run — no batches found yet, baseline saved (will alert when batches appear)")
+
+        elif changed and not is_first:
             logger.info(f"🔔 CHANGE DETECTED for {key}")
             logger.info(f"   Batches found: {len(batches)}")
             try:
@@ -107,9 +119,6 @@ def run_monitor():
             except Exception as e:
                 logger.error(f"Failed to send alert: {e}")
                 any_error = True
-
-        elif is_first:
-            logger.info(f"📋 First run — baseline saved ({len(batches)} batch(es) currently listed)")
 
         else:
             logger.info(f"✓  No change ({len(batches)} batch(es), hash={new_hash[:12]}...)")
