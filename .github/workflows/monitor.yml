@@ -53,7 +53,7 @@ jobs:
 
       # ── Telegram bot ────────────────────────────────────────────────────────
       - name: Run Telegram bot
-        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
+        if: env.TELEGRAM_BOT_TOKEN != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
