@@ -1,8 +1,53 @@
 {
   "Western|Pune|AICITSS - Advanced Information Technology": {
-    "hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    "batches": [],
-    "last_checked": "2026-04-08T03:55:10.568670Z",
+    "hash": "7966c3de0250aa7205730fa28a9365391ae0d297aede86a125a489fd6ecdf792",
+    "batches": [
+      {
+        "Batch No": "AICITSSAdvITT__PUNE_113",
+        "Available Seats": "0",
+        "From Date": "15/04/2026",
+        "To Date": "29/04/2026",
+        "Batch Time": "7-0-AM to 1-0-PM",
+        "Pou Name": "PUNE",
+        "Course": "AICITSS - Advanced Information Technology",
+        "Open For": "General",
+        "Registration Start Date": ""
+      },
+      {
+        "Batch No": "AICITSSAdvITT__PUNE_114",
+        "Available Seats": "0",
+        "From Date": "15/04/2026",
+        "To Date": "29/04/2026",
+        "Batch Time": "2-0-PM to 8-0-PM",
+        "Pou Name": "PUNE",
+        "Course": "AICITSS - Advanced Information Technology",
+        "Open For": "General",
+        "Registration Start Date": ""
+      },
+      {
+        "Batch No": "AICITSSAdvITT__PUNE_115",
+        "Available Seats": "0",
+        "From Date": "02/05/2026",
+        "To Date": "16/05/2026",
+        "Batch Time": "7-0-AM to 1-0-PM",
+        "Pou Name": "PUNE",
+        "Course": "AICITSS - Advanced Information Technology",
+        "Open For": "General",
+        "Registration Start Date": ""
+      },
+      {
+        "Batch No": "AICITSSAdvITT__PUNE_116",
+        "Available Seats": "26",
+        "From Date": "02/05/2026",
+        "To Date": "16/05/2026",
+        "Batch Time": "2-0-PM to 8-0-PM",
+        "Pou Name": "PUNE",
+        "Course": "AICITSS - Advanced Information Technology",
+        "Open For": "General",
+        "Registration Start Date": "26/03/2026"
+      }
+    ],
+    "last_checked": "2026-04-08T04:18:31.403660Z",
     "region": "Western",
     "pou": "Pune",
     "course": "AICITSS - Advanced Information Technology"
