@@ -51,5 +51,34 @@
     "region": "Western",
     "pou": "Pune",
     "course": "AICITSS - Advanced Information Technology"
+  },
+  "Western|Pune|Advanced (ICITSS) MCS Course": {
+    "hash": "ec8cc3f62a5157bc8fda1f9ea60ac980f37a6fb19b21cf4a0f8b2227a9407d9d",
+    "batches": [
+      {
+        "Batch No": "AdvICITSSMCS__PUNE_114",
+        "Available Seats": "0",
+        "From Date": "27/04/2026",
+        "To Date": "14/05/2026",
+        "Batch Time": "7-30-AM to 1-30-PM",
+        "Pou Name": "PUNE",
+        "Course": "Advanced (ICITSS) MCS Course",
+        "Open For": "General"
+      },
+      {
+        "Batch No": "AdvICITSSMCS__PUNE_115",
+        "Available Seats": "0",
+        "From Date": "27/04/2026",
+        "To Date": "14/05/2026",
+        "Batch Time": "2-0-PM to 8-0-PM",
+        "Pou Name": "PUNE",
+        "Course": "Advanced (ICITSS) MCS Course",
+        "Open For": "General"
+      }
+    ],
+    "last_checked": "2026-04-08T04:58:53.303530Z",
+    "region": "Western",
+    "pou": "Pune",
+    "course": "Advanced (ICITSS) MCS Course"
   }
 }
