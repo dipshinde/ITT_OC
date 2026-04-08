@@ -50,6 +50,7 @@ jobs:
       # ── 4. Run the monitor ──────────────────────────────────────────────────
       - name: Run monitor (normal)
         if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'normal' }}
+        continue-on-error: true   # Don't mark job red on scrape errors — logs still visible
         env:
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
