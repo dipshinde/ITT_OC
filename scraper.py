@@ -165,14 +165,36 @@ def scrape_batches(region: str, pou: str, course: str) -> list[dict]:
         raise ValueError(f"Region '{region}' not found in dropdown '{region_field}'")
 
     logger.info(f"  → field={region_field!r}  value={region_value!r}")
-    soup = _do_postback(session, soup,
-                        event_target=region_field,
-                        extra_fields={region_field: region_value},
-                        step_label=f"Select Region={region}")
-    _dump_all_selects(soup, "after region select")
+soup = _do_postback(session, soup,
+                    event_target=course_field,
+                    extra_fields={
+                        region_field: region_value,
+                        pou_field:    pou_value,
+                        course_field: course_value,
+                    },
+                    step_label=f"Select Course={course}")
 
-    # ── PoU dropdown ──────────────────────────────────────────────────────────
-    logger.info(f"\n━━━ Step 3: Selecting PoU = '{pou}'")
+# ── Step 4.5: Click "Get List" button to load the results table ───────────
+logger.info("\n━━━ Step 4.5: Clicking 'Get List' button")
+payload = _extract_viewstate(soup)
+payload.pop("__EVENTTARGET", None)       # must be absent for button-click POSTs
+payload.pop("__EVENTARGUMENT", None)
+payload[region_field]  = region_value
+payload[pou_field]     = pou_value
+payload[course_field]  = course_value
+payload["btn_getlist"] = "Get List"      # the actual button click
+
+headers = {**HEADERS, "Content-Type": "application/x-www-form-urlencoded",
+           "Origin": "https://www.icaionlineregistration.org",
+           "Referer": BASE_URL}
+time.sleep(1)
+resp = session.post(BASE_URL, data=payload, headers=headers, timeout=30)
+logger.info(f"  Response: HTTP {resp.status_code}  ({len(resp.text)} chars)")
+resp.raise_for_status()
+soup = BeautifulSoup(resp.text, "lxml")
+
+# ── Parse results ─────────────────────────────────────────────────────────
+logger.info("\n━━━ Step 5: Parsing batch results")
     pou_sel = (
         _find_select_by_keywords(soup, "pou", "branch", "centre", "city", "place", "unit") or
         _find_select_by_index(soup, 1)
