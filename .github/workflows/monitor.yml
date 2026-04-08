@@ -2,12 +2,7 @@ name: ICAI Batch Monitor
 
 on:
   schedule:
-    # Runs every 10 minutes
-    # GitHub Actions minimum interval is 5 minutes
-    # Note: free for public repos (unlimited minutes)
-    - cron: "*/10 * * * *"
-
-  # Allow manual trigger from GitHub Actions UI (useful for testing)
+    - cron: "*/10 * * * *"   # every 10 minutes
   workflow_dispatch:
     inputs:
       mode:
@@ -19,64 +14,66 @@ on:
           - normal
           - debug
           - test-email
+          - test-telegram
+
+permissions:
+  contents: write   # needed to commit users.json back to repo
 
 jobs:
-  monitor:
-    name: Check ICAI Batches
+  check:
     runs-on: ubuntu-latest
-    # Required so the job can commit state.json back to the repo
-    permissions:
-      contents: write
 
     steps:
-      # ── 1. Checkout repo ────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          # Use the token that has write access
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
-      # ── 3. Install dependencies ─────────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Run the monitor ──────────────────────────────────────────────────
-      - name: Run monitor (normal)
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'normal' }}
-        continue-on-error: true   # Don't mark job red on scrape errors — logs still visible
+      # ── Email monitor (existing) ────────────────────────────────────────────
+      - name: Run email monitor
+        if: ${{ github.event.inputs.mode != 'test-telegram' }}
         env:
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "debug" ]; then
+            python monitor.py --debug
+          elif [ "${{ github.event.inputs.mode }}" = "test-email" ]; then
+            python monitor.py --test-email
+          else
+            python monitor.py
+          fi
 
-      - name: Run monitor (debug)
-        if: ${{ github.event.inputs.mode == 'debug' }}
-        run: python monitor.py --debug
-
-      - name: Send test email
-        if: ${{ github.event.inputs.mode == 'test-email' }}
+      # ── Telegram bot ────────────────────────────────────────────────────────
+      - name: Run Telegram bot
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
         env:
-          GMAIL_USER:     ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
-          ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py --test-email
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "test-telegram" ]; then
+            python -c "
+          import os, requests
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          r = requests.get(f'https://api.telegram.org/bot{token}/getMe')
+          print('Bot info:', r.json())
+          "
+          else
+            python bot.py
+          fi
 
-      # ── 5. Commit updated state.json back to repo ───────────────────────────
-      # This is how state persists between runs — no external database needed.
-      - name: Commit state
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'normal' }}
+      # ── Commit updated users.json ────────────────────────────────────────────
+      - name: Commit users.json if changed
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          # Only commit if state.json actually changed
-          git diff --staged --quiet || git commit -m "chore: update batch state [$(date -u '+%Y-%m-%d %H:%M')] [skip ci]"
+          git add users.json
+          git diff --cached --quiet || git commit -m "chore: update users.json [skip ci]"
           git push
