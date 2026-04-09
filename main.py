@@ -1,0 +1,138 @@
+"""
+main.py
+-------
+Persistent entry point for the ICAI Telegram Bot.
+
+Runs two concurrent loops:
+  1. Telegram polling loop  — checks for user messages every 2 s
+  2. Background monitor     — scrapes ICAI and sends alerts every 10 min
+
+Deploy on Railway / Render / any VPS:
+  railway run python main.py
+  OR: set start command to `python main.py`
+"""
+
+import threading
+import time
+import logging
+import signal
+import sys
+
+from bot import load_state, save_state, process_updates, scrape_and_alert, STATE_LOCK
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+POLL_INTERVAL_SEC   = 2      # how often to check Telegram for new messages
+MONITOR_INTERVAL_SEC = 600   # how often to scrape ICAI (10 minutes)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+_shutdown = threading.Event()
+
+def _handle_signal(signum, frame):
+    logger.info(f"Signal {signum} received — shutting down gracefully...")
+    _shutdown.set()
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT,  _handle_signal)
+
+# ─── Background monitor thread ────────────────────────────────────────────────
+
+def background_monitor():
+    """
+    Wakes up every MONITOR_INTERVAL_SEC, scrapes ICAI for every active user,
+    and sends Telegram alerts if new or changed batches are detected.
+    """
+    logger.info("Background monitor started.")
+    # Run immediately on first wake (don't wait 10 min for first check)
+    first_run = True
+
+    while not _shutdown.is_set():
+        if not first_run:
+            # Sleep in small chunks so we can react to shutdown quickly
+            for _ in range(MONITOR_INTERVAL_SEC):
+                if _shutdown.is_set():
+                    break
+                time.sleep(1)
+        first_run = False
+
+        if _shutdown.is_set():
+            break
+
+        logger.info("═══ Batch monitor cycle starting ═══")
+        try:
+            with STATE_LOCK:
+                state = load_state()
+
+            scrape_and_alert(state)   # sends Telegram messages internally
+
+            with STATE_LOCK:
+                save_state(state)
+        except Exception as e:
+            logger.error(f"Monitor cycle error: {e}", exc_info=True)
+
+    logger.info("Background monitor stopped.")
+
+# ─── Telegram polling loop ────────────────────────────────────────────────────
+
+def telegram_polling_loop():
+    """
+    Continuously polls Telegram for new messages / button taps.
+    Saves updated state (offset + user prefs) after every batch of updates.
+    """
+    logger.info("Telegram polling loop started.")
+
+    while not _shutdown.is_set():
+        try:
+            with STATE_LOCK:
+                state = load_state()
+
+            process_updates(state)
+
+            with STATE_LOCK:
+                save_state(state)
+
+        except Exception as e:
+            logger.error(f"Polling error: {e}", exc_info=True)
+
+        # Sleep in small chunks so shutdown is responsive
+        for _ in range(POLL_INTERVAL_SEC):
+            if _shutdown.is_set():
+                break
+            time.sleep(1)
+
+    logger.info("Telegram polling loop stopped.")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    logger.info("╔══════════════════════════════════════════╗")
+    logger.info("║   ICAI Batch Monitor Bot — starting up   ║")
+    logger.info("╚══════════════════════════════════════════╝")
+
+    # Start background monitor as daemon thread
+    monitor_thread = threading.Thread(
+        target=background_monitor,
+        name="BatchMonitor",
+        daemon=True,
+    )
+    monitor_thread.start()
+
+    # Run Telegram polling on the main thread (blocks until shutdown)
+    telegram_polling_loop()
+
+    logger.info("Main thread exiting. Waiting for monitor thread...")
+    monitor_thread.join(timeout=10)
+    logger.info("Shutdown complete.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
