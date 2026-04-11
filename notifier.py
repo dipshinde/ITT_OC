@@ -15,26 +15,35 @@ To create a Gmail App Password:
   4. Copy the 16-char code into your GitHub Secret
 """
 
-import smtplib
-import os
+import html
 import logging
-from email.mime.text import MIMEText
+import os
+import smtplib
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from email.mime.text import MIMEText
 
 logger = logging.getLogger(__name__)
+
+# IST = UTC+5:30
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _esc(s) -> str:
+    return html.escape(str(s))
 
 
 def _build_email_body(batches: list[dict], region: str, pou: str, course: str) -> tuple[str, str]:
     """Build plain-text and HTML versions of the alert email."""
 
-    timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    # Use IST for timestamps so Indian recipients see a sensible time
+    timestamp = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 
     # ── Plain text ─────────────────────────────────────────────────────────────
     lines = [
-        "🚨 ICAI BATCH ALERT",
+        "ICAI BATCH ALERT",
         "=" * 50,
-        f"New/updated batch(es) detected for your preferences:",
+        "New/updated batch(es) detected for your preferences:",
         f"  Region : {region}",
         f"  PoU    : {pou}",
         f"  Course : {course}",
@@ -63,41 +72,41 @@ def _build_email_body(batches: list[dict], region: str, pou: str, course: str) -
     table_rows = ""
     if batches:
         headers = list(batches[0].keys())
-        header_cells = "".join(f"<th style='padding:8px 12px;background:#1a3c6e;color:#fff;text-align:left'>{h}</th>" for h in headers)
+        header_cells = "".join(
+            f"<th style='padding:8px 12px;background:#1a3c6e;color:#fff;text-align:left'>{_esc(h)}</th>"
+            for h in headers
+        )
         table_rows += f"<tr>{header_cells}</tr>"
         for i, batch in enumerate(batches):
             bg = "#f0f4ff" if i % 2 == 0 else "#ffffff"
             cells = "".join(
-                f"<td style='padding:8px 12px;border-bottom:1px solid #e0e0e0'>{batch.get(h, '')}</td>"
+                f"<td style='padding:8px 12px;border-bottom:1px solid #e0e0e0'>{_esc(batch.get(h, ''))}</td>"
                 for h in headers
             )
             table_rows += f"<tr style='background:{bg}'>{cells}</tr>"
 
-    html = f"""
+    html_body = f"""
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f5f5f5">
   <div style="max-width:680px;margin:30px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 
-    <!-- Header -->
     <div style="background:#1a3c6e;padding:24px 32px">
-      <h1 style="color:#fff;margin:0;font-size:22px">🚨 ICAI Batch Alert</h1>
+      <h1 style="color:#fff;margin:0;font-size:22px">ICAI Batch Alert</h1>
       <p style="color:#a8c4e8;margin:6px 0 0">New or updated batch detected</p>
     </div>
 
-    <!-- Preferences summary -->
     <div style="padding:24px 32px;border-bottom:1px solid #eee">
       <h2 style="color:#1a3c6e;font-size:16px;margin:0 0 12px">Your Preferences</h2>
       <table style="border-collapse:collapse">
-        <tr><td style="color:#666;padding:4px 16px 4px 0">Region</td><td style="font-weight:bold">{region}</td></tr>
-        <tr><td style="color:#666;padding:4px 16px 4px 0">Place of Utilization</td><td style="font-weight:bold">{pou}</td></tr>
-        <tr><td style="color:#666;padding:4px 16px 4px 0">Course</td><td style="font-weight:bold">{course}</td></tr>
-        <tr><td style="color:#666;padding:4px 16px 4px 0">Detected at</td><td style="font-weight:bold">{timestamp}</td></tr>
+        <tr><td style="color:#666;padding:4px 16px 4px 0">Region</td><td style="font-weight:bold">{_esc(region)}</td></tr>
+        <tr><td style="color:#666;padding:4px 16px 4px 0">Place of Utilization</td><td style="font-weight:bold">{_esc(pou)}</td></tr>
+        <tr><td style="color:#666;padding:4px 16px 4px 0">Course</td><td style="font-weight:bold">{_esc(course)}</td></tr>
+        <tr><td style="color:#666;padding:4px 16px 4px 0">Detected at</td><td style="font-weight:bold">{_esc(timestamp)}</td></tr>
       </table>
     </div>
 
-    <!-- Batch table -->
     <div style="padding:24px 32px">
       <h2 style="color:#1a3c6e;font-size:16px;margin:0 0 16px">Available Batch(es)</h2>
       <div style="overflow-x:auto">
@@ -107,18 +116,16 @@ def _build_email_body(batches: list[dict], region: str, pou: str, course: str) -
       </div>
     </div>
 
-    <!-- CTA -->
     <div style="padding:0 32px 32px;text-align:center">
       <a href="https://www.icaionlineregistration.org/launchbatchdetail.aspx"
          style="display:inline-block;background:#1a3c6e;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:15px">
-        Register on ICAI Portal →
+        Register on ICAI Portal
       </a>
       <p style="color:#999;font-size:12px;margin:16px 0 0">
         Seats fill up fast. Register at the earliest opportunity.
       </p>
     </div>
 
-    <!-- Footer -->
     <div style="background:#f5f5f5;padding:16px 32px;text-align:center">
       <p style="color:#aaa;font-size:12px;margin:0">
         ICAI Batch Monitor · Automated alert · Checked every 10 minutes
@@ -129,7 +136,7 @@ def _build_email_body(batches: list[dict], region: str, pou: str, course: str) -
 </body>
 </html>
 """
-    return plain, html
+    return plain, html_body
 
 
 def send_alert(batches: list[dict], region: str, pou: str, course: str):
@@ -137,8 +144,8 @@ def send_alert(batches: list[dict], region: str, pou: str, course: str):
     Send an email alert via Gmail SMTP.
     Reads credentials from environment variables (set as GitHub Secrets).
     """
-    gmail_user = os.environ.get("GMAIL_USER")
-    gmail_pass = os.environ.get("GMAIL_APP_PASS")
+    gmail_user  = os.environ.get("GMAIL_USER")
+    gmail_pass  = os.environ.get("GMAIL_APP_PASS")
     alert_email = os.environ.get("ALERT_EMAIL", gmail_user)
 
     if not gmail_user or not gmail_pass:
@@ -147,16 +154,15 @@ def send_alert(batches: list[dict], region: str, pou: str, course: str):
             "Set them as GitHub Secrets."
         )
 
-    subject = f"🚨 ICAI Batch Alert — {course} | {pou} ({region})"
-    plain, html = _build_email_body(batches, region, pou, course)
+    subject        = f"ICAI Batch Alert — {course} | {pou} ({region})"
+    plain, html_body = _build_email_body(batches, region, pou, course)
 
-    # Build MIME email with both plain and HTML parts
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"ICAI Monitor <{gmail_user}>"
-    msg["To"] = alert_email
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html, "html"))
+    msg["From"]    = f"ICAI Monitor <{gmail_user}>"
+    msg["To"]      = alert_email
+    msg.attach(MIMEText(plain,     "plain"))
+    msg.attach(MIMEText(html_body, "html"))
 
     logger.info(f"Sending alert email to {alert_email}...")
 
@@ -164,19 +170,19 @@ def send_alert(batches: list[dict], region: str, pou: str, course: str):
         server.login(gmail_user, gmail_pass)
         server.sendmail(gmail_user, alert_email, msg.as_string())
 
-    logger.info("✅ Alert email sent successfully")
+    logger.info("Alert email sent successfully")
 
 
 def send_test_email():
-    """Send a test email to verify credentials are working (used during setup)."""
+    """Send a test email to verify credentials are working."""
     dummy_batches = [
         {
-            "Batch No": "TEST-001",
-            "Start Date": "01 May 2026",
-            "End Date": "05 May 2026",
-            "Venue": "Pune ICAI Office",
+            "Batch No":        "TEST-001",
+            "Start Date":      "01 May 2026",
+            "End Date":        "05 May 2026",
+            "Venue":           "Pune ICAI Office",
             "Available Seats": "40",
-            "Status": "Open",
+            "Status":          "Open",
         }
     ]
     send_alert(dummy_batches, region="Western", pou="Pune",
