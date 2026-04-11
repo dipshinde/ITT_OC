@@ -18,7 +18,7 @@ import logging
 import signal
 import sys
 
-from bot import load_state, save_state, process_updates, scrape_and_alert, STATE_LOCK
+from bot import load_state, save_state, process_updates, scrape_and_alert, STATE_LOCK, start_cleanup_scheduler
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -120,6 +120,8 @@ def main():
     logger.info("╔══════════════════════════════════════════╗")
     logger.info("║   ICAI Batch Monitor Bot — starting up   ║")
     logger.info("╚══════════════════════════════════════════╝")
+
+    start_cleanup_scheduler()
 
     monitor_thread = threading.Thread(
         target=background_monitor,
