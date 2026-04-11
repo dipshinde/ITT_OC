@@ -27,6 +27,13 @@ Fixes applied in this version
                        know immediately when the ICAI page DOM has changed or the
                        site is down.
 
+  4. DB CLEANUP      — /stop and /registered fully DELETE the user document from
+                       MongoDB instead of leaving stale data behind.
+                       A daily cleanup job runs at 1:00 AM (IST) and removes any
+                       stuck/incomplete user documents (those that started setup
+                       but never finished — they have a pending object but no
+                       region/course).
+
 Thread safety: all state I/O is wrapped in STATE_LOCK (defined here,
 used by main.py and background monitor).
 """
@@ -91,9 +98,6 @@ STATE_LOCK = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIX 1 — MESSAGE QUEUE
 # ═══════════════════════════════════════════════════════════════════════════════
-# Telegram rate limits: 30 messages/second globally, 1 message/second per chat.
-# When a batch alert fires for many users simultaneously, naïve sends cause 429s.
-# Solution: a background worker drains a queue with enforced delays.
 
 _MSG_QUEUE: queue.Queue = queue.Queue()
 _GLOBAL_SEND_DELAY  = 0.05   # seconds between any two sends (≈ 20 msg/s, safe margin)
@@ -119,14 +123,9 @@ def _queue_worker():
 
         with _queue_lock:
             now = time.monotonic()
-
-            # Per-chat throttle
-            last_chat = _last_sent_per_chat.get(chat_id, 0.0)
-            wait_chat = max(0.0, _PER_CHAT_DELAY - (now - last_chat))
-
-            # Global throttle
+            last_chat   = _last_sent_per_chat.get(chat_id, 0.0)
+            wait_chat   = max(0.0, _PER_CHAT_DELAY - (now - last_chat))
             wait_global = max(0.0, _GLOBAL_SEND_DELAY - (now - _last_sent_global))
-
             wait = max(wait_chat, wait_global)
 
         if wait > 0:
@@ -136,7 +135,6 @@ def _queue_worker():
             r = requests.post(f"{API_BASE}/{method}", json=payload, timeout=15)
             result = r.json()
             if not result.get("ok"):
-                # 429 = flood — re-queue after retry_after seconds
                 if r.status_code == 429:
                     retry_after = result.get("parameters", {}).get("retry_after", 5)
                     logger.warning(f"Telegram 429 — retrying after {retry_after}s (chat {chat_id})")
@@ -160,7 +158,7 @@ _worker_thread = threading.Thread(target=_queue_worker, name="MsgQueueWorker", d
 _worker_thread.start()
 
 
-# --- Telegram helpers (now enqueue instead of direct POST) -------------------
+# --- Telegram helpers --------------------------------------------------------
 
 def tg(method: str, **data):
     """Low-level direct call — use only for getUpdates and answerCallbackQuery."""
@@ -231,7 +229,7 @@ def _check_and_alert_heartbeat():
     Only alerts once per failure streak (tracks 'admin_alerted' flag in DB).
     """
     if not ADMIN_CHAT_ID:
-        return   # admin notifications not configured
+        return
 
     hb = get_heartbeat()
     failures = hb.get("consecutive_failures", 0)
@@ -247,7 +245,6 @@ def _check_and_alert_heartbeat():
             f"<i>The ICAI page DOM may have changed, or the site may be down. "
             f"Check Railway logs immediately.</i>"
         )
-        # Direct send (bypass queue — this is an admin alert, must go out fast)
         try:
             requests.post(
                 f"{API_BASE}/sendMessage",
@@ -255,7 +252,6 @@ def _check_and_alert_heartbeat():
                 timeout=15,
             )
             logger.warning(f"Admin heartbeat alert sent ({failures} consecutive failures)")
-            # Mark as alerted so we don't spam
             from db import _heartbeat_col
             _heartbeat_col().update_one(
                 {"_id": "status"},
@@ -265,7 +261,6 @@ def _check_and_alert_heartbeat():
             logger.error(f"Failed to send admin heartbeat alert: {e}")
 
     elif failures == 0 and hb.get("admin_alerted"):
-        # Recovery — clear the flag so next failure streak alerts again
         try:
             from db import _heartbeat_col
             _heartbeat_col().update_one(
@@ -274,6 +269,90 @@ def _check_and_alert_heartbeat():
             )
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX 4 — DB CLEANUP helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _delete_user_from_db(chat_id: str):
+    """Fully remove a user document from MongoDB."""
+    try:
+        from db import _users_col
+        _users_col().delete_one({"_id": chat_id})
+        logger.info(f"Deleted user {chat_id} from MongoDB.")
+    except Exception as e:
+        logger.warning(f"Could not delete user {chat_id} from DB: {e}")
+
+
+def cleanup_stuck_users():
+    """
+    Runs daily at 1:00 AM IST. Deletes:
+      1. Users stuck mid-setup (have 'pending' but no 'course')
+      2. Dead entries (active=False, not registered, no course)
+    Sends a summary to ADMIN_CHAT_ID if any documents were removed.
+    """
+    logger.info("[Daily Cleanup] Running stuck-user cleanup...")
+    try:
+        from db import _users_col
+        col = _users_col()
+
+        # Stuck mid-setup: has pending but no course
+        result1 = col.delete_many({
+            "pending": {"$exists": True},
+            "course":  {"$exists": False},
+            "_id":     {"$ne": "__meta__"},
+        })
+
+        # Dead entries: not active, not registered, no course
+        result2 = col.delete_many({
+            "active":     False,
+            "registered": {"$in": [False, None]},
+            "course":     {"$exists": False},
+            "_id":        {"$ne": "__meta__"},
+        })
+
+        total = result1.deleted_count + result2.deleted_count
+        logger.info(f"[Daily Cleanup] Removed {total} stale user document(s) from MongoDB.")
+
+        if ADMIN_CHAT_ID:
+            send(
+                ADMIN_CHAT_ID,
+                f"🧹 <b>Daily DB Cleanup — 1:00 AM IST</b>\n\n"
+                f"Removed <b>{total}</b> stale/stuck user document(s) from MongoDB.\n"
+                f"Your database is clean! ✅",
+            )
+    except Exception as e:
+        logger.error(f"[Daily Cleanup] Failed: {e}")
+
+
+def start_cleanup_scheduler():
+    """
+    Starts a background daemon thread that runs cleanup_stuck_users()
+    every day at 1:00 AM IST (= 19:30 UTC).
+    Call this once from main.py at startup.
+    """
+    def _scheduler():
+        logger.info("Daily cleanup scheduler started — will run at 1:00 AM IST every day.")
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            # 1:00 AM IST = UTC+5:30 = 19:30 UTC
+            target_hour, target_minute = 19, 30
+            next_run = now_utc.replace(
+                hour=target_hour, minute=target_minute, second=0, microsecond=0
+            )
+            if now_utc >= next_run:
+                from datetime import timedelta
+                next_run += timedelta(days=1)
+            wait_seconds = (next_run - now_utc).total_seconds()
+            logger.info(
+                f"[Daily Cleanup] Next run in {wait_seconds / 3600:.1f} hours (1:00 AM IST)."
+            )
+            time.sleep(wait_seconds)
+            cleanup_stuck_users()
+
+    t = threading.Thread(target=_scheduler, name="DailyCleanup", daemon=True)
+    t.start()
 
 
 # --- ICAI helpers -------------------------------------------------------------
@@ -299,7 +378,7 @@ def fetch_regions():
 def fetch_pous(region_value: str):
     """POST region selection and return PoU options as (label, value)."""
     try:
-        r0   = requests.get(ICAI_URL, headers=ICAI_HEADERS, timeout=20)
+        r0    = requests.get(ICAI_URL, headers=ICAI_HEADERS, timeout=20)
         soup0 = BeautifulSoup(r0.text, "lxml")
 
         def vs(name):
@@ -319,9 +398,9 @@ def fetch_pous(region_value: str):
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": ICAI_URL,
         }
-        r1   = requests.post(ICAI_URL, data=payload, headers=headers, timeout=20)
+        r1    = requests.post(ICAI_URL, data=payload, headers=headers, timeout=20)
         soup1 = BeautifulSoup(r1.text, "lxml")
-        sel  = soup1.find("select", {"id": "ddlPou"})
+        sel   = soup1.find("select", {"id": "ddlPou"})
         if not sel:
             return []
         return [
@@ -339,11 +418,8 @@ def fetch_pous(region_value: str):
 def start_setup(chat_id: str, state: dict, message_id=None):
     """Begin the Region -> PoU -> Course selection flow."""
     if _is_processing(chat_id, state):
-        # Already locked — drop duplicate silently, no spam
         return
 
-    # Persist lock to DB immediately so next poll cycle (which reloads state
-    # from MongoDB) also sees processing=True and drops the duplicate request.
     _set_processing(chat_id, state, True)
     save_state(state)
 
@@ -388,7 +464,6 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
         send(chat_id, "Region not recognised. Type /watch to restart.")
         return
 
-    # Persist lock before slow network call (same reason as start_setup)
     _set_processing(chat_id, state, True)
     save_state(state)
     try:
@@ -494,9 +569,7 @@ def handle_message(msg: dict, state: dict):
     chat_id = str(msg["chat"]["id"])
     text    = msg.get("text", "").strip()
 
-    # FIX 2: block commands while a setup step is in-flight
     if _is_processing(chat_id, state):
-        # Drop silently — start_setup will send the region keyboard once done
         return
 
     if text.startswith("/start") or text.startswith("/watch"):
@@ -504,9 +577,7 @@ def handle_message(msg: dict, state: dict):
 
     elif text.startswith("/status"):
         u = state["users"].get(chat_id, {})
-        if u.get("registered"):
-            send(chat_id, "You've already marked yourself as registered. Use /watch to monitor a new batch.")
-        elif u.get("active"):
+        if u.get("active"):
             send(
                 chat_id,
                 f"<b>Currently watching:</b>\n\n"
@@ -519,8 +590,10 @@ def handle_message(msg: dict, state: dict):
             send(chat_id, "No active watch. Use /watch to set one up.")
 
     elif text.startswith("/stop"):
+        # FIX 4: fully delete user from MongoDB on /stop
         if chat_id in state["users"]:
-            state["users"][chat_id]["active"] = False
+            del state["users"][chat_id]
+            _delete_user_from_db(chat_id)
         send(chat_id, "Alerts paused. Use /watch anytime to resubscribe.")
 
     elif text.lower().startswith("/registered") or text.lower() == "registered":
@@ -544,26 +617,19 @@ def handle_message(msg: dict, state: dict):
 
 def _handle_registered(chat_id: str, state: dict):
     u = state["users"].get(chat_id, {})
-    # Allow registered even if user did /stop first (active=False but still subscribed)
     if not u or not u.get("course"):
         send(chat_id, "You don't have a watch set up. Use /watch to get started.")
-        return
-    if u.get("registered"):
-        send(chat_id, "You've already marked yourself as registered. Use /watch to monitor a new batch.")
         return
 
     region = u.get("region", "")
     pou    = u.get("pou", "")
     course = u.get("course", "")
 
-    state["users"][chat_id] = {
-        "region":     region,
-        "pou":        pou,
-        "course":     course,
-        "active":     False,
-        "registered": True,
-    }
+    # FIX 4: fully delete user from MongoDB on /registered
+    del state["users"][chat_id]
+    _delete_user_from_db(chat_id)
 
+    # Clean up seat alert state for this key
     key = _make_key(region, pou, course)
     try:
         batch_state = load_batch_state()
@@ -587,7 +653,6 @@ def handle_callback(cb: dict, state: dict):
     data       = cb.get("data", "")
     cb_id      = cb["id"]
 
-    # FIX 2: if already processing, answer the callback and bail
     if _is_processing(chat_id, state):
         answer_cb(cb_id, "⏳ Still loading, please wait...")
         return
@@ -603,7 +668,6 @@ def handle_callback(cb: dict, state: dict):
         ask_course(chat_id, data[len("pou:"):], state, message_id)
     elif data.startswith("course:") and pending_step == "course":
         confirm_subscription(chat_id, data[len("course:"):], state, message_id)
-    # else: stale button tap from a previous setup flow — ignore silently
 
 
 # --- Poll Telegram updates ----------------------------------------------------
@@ -681,15 +745,11 @@ def _make_key(region: str, pou: str, course: str) -> str:
 
 def scrape_and_alert(state: dict):
     """
-    For every active (non-registered) subscribed user:
+    For every active subscribed user:
       1. Scrape current batches from ICAI
       2. Alert on any hash change (new/updated batches)
       3. Independently check seat thresholds (15/10/5/1) and alert per batch
-      4. Skip users who have sent /registered
-      5. Persist updated state to MongoDB
-
-    FIX 3: records heartbeat after each key. On repeated failures, an admin
-    alert is sent via Telegram so you know the moment the ICAI DOM breaks.
+      4. Persist updated batch state to MongoDB
     """
     users       = state.get("users", {})
     batch_state = load_batch_state()
@@ -698,16 +758,12 @@ def scrape_and_alert(state: dict):
     for chat_id, u in users.items():
         if not u.get("active"):
             continue
-        if u.get("registered"):
-            continue
         if "pending" in u:
             continue
         if not (u.get("region") and u.get("pou") and u.get("course")):
             continue
         key = _make_key(u["region"], u["pou"], u["course"])
         watchlist.setdefault(key, []).append(chat_id)
-
-    any_success = False
 
     for key, chat_ids in watchlist.items():
         region, pou, course = key.split("|", 2)
@@ -716,13 +772,10 @@ def scrape_and_alert(state: dict):
         try:
             batches  = scrape_batches(region, pou, course)
             new_hash = compute_hash(batches)
-            any_success = True
-            # FIX 3: record success
             record_heartbeat_ok()
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             logger.error(f"Scrape failed for {key}: {err_str}", exc_info=True)
-            # FIX 3: record failure and maybe alert admin
             record_heartbeat_fail(err_str)
             _check_and_alert_heartbeat()
             continue
@@ -752,7 +805,7 @@ def scrape_and_alert(state: dict):
                 )
                 seat_alerts_sent.setdefault(batch_no, []).extend(fires)
 
-        # ── 2. Persist updated state ──────────────────────────────────────────
+        # ── 2. Persist updated batch state ────────────────────────────────────
         batch_state[key] = {
             "hash":             new_hash,
             "batches":          batches,
