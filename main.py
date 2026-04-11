@@ -71,10 +71,15 @@ def background_monitor():
             with STATE_LOCK:
                 state = load_state()
 
+            # NOTE: scrape_and_alert only READS from state (builds watchlist) and
+            # writes its own data via save_batch_state(). It never modifies the
+            # state dict itself. We must NOT call save_state(state) here because
+            # this thread loaded state at the START of a 60-second cycle — saving
+            # it back at the END would clobber the _offset that the polling thread
+            # has advanced in the meantime, causing Telegram to re-deliver already-
+            # processed updates (e.g. /start) and trigger duplicate messages.
             scrape_and_alert(state)   # sends Telegram messages internally
 
-            with STATE_LOCK:
-                save_state(state)
         except Exception as e:
             logger.error(f"Monitor cycle error: {e}", exc_info=True)
 
