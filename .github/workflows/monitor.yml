@@ -1,4 +1,8 @@
-name: ICAI Batch Monitor
+name: ICAI Batch Email Monitor
+
+# Runs every 10 minutes via GitHub Actions to send email alerts.
+# The Railway-deployed Telegram bot handles Telegram notifications separately.
+# Both share the same MongoDB database for batch state.
 
 on:
   schedule:
@@ -14,10 +18,9 @@ on:
           - normal
           - debug
           - test-email
-          - test-telegram
 
 permissions:
-  contents: write   # needed to commit users.json back to repo
+  contents: read   # read-only — no more committing state files to the repo
 
 jobs:
   check:
@@ -35,10 +38,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── Email monitor (existing) ────────────────────────────────────────────
       - name: Run email monitor
-        if: ${{ github.event.inputs.mode != 'test-telegram' }}
         env:
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
+          MONGODB_DB:     ${{ secrets.MONGODB_DB }}
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
@@ -50,30 +53,3 @@ jobs:
           else
             python monitor.py
           fi
-
-      # ── Telegram bot ────────────────────────────────────────────────────────
-      - name: Run Telegram bot
-        if: env.TELEGRAM_BOT_TOKEN != ''
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          if [ "${{ github.event.inputs.mode }}" = "test-telegram" ]; then
-            python -c "
-          import os, requests
-          token = os.environ['TELEGRAM_BOT_TOKEN']
-          r = requests.get(f'https://api.telegram.org/bot{token}/getMe')
-          print('Bot info:', r.json())
-          "
-          else
-            python bot.py
-          fi
-
-      # ── Commit updated users.json ────────────────────────────────────────────
-      - name: Commit users.json if changed
-        if: env.TELEGRAM_BOT_TOKEN != ''
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add users.json
-          git diff --cached --quiet || git commit -m "chore: update users.json [skip ci]"
-          git push
