@@ -5,10 +5,11 @@ Core Telegram bot logic for the ICAI Batch Monitor.
 
 Responsibilities:
   - User onboarding flow: Region -> PoU -> Course (inline keyboard)
-  - Command handling: /start /watch /status /stop /help
-  - scrape_and_alert(): called by background monitor thread every 10 min
+  - Command handling: /start /watch /status /stop /registered /help
+  - scrape_and_alert(): called by background monitor thread every 60 s
+  - Seat-threshold alerts: notifies at 15 / 10 / 5 / 1 seats remaining
   - State persistence: users.json (user prefs + Telegram offset)
-                       state.json (batch hashes per watchlist key)
+                       state.json (batch hashes + seat alert history)
 
 Thread safety: all file I/O should be wrapped in STATE_LOCK (defined here,
 used by main.py and background monitor).
@@ -46,6 +47,9 @@ ICAI_HEADERS = {
 USERS_FILE = "users.json"
 STATE_FILE = "state.json"
 
+# Seat thresholds at which to send a special low-seat alert (descending)
+SEAT_THRESHOLDS = [15, 10, 5, 1]
+
 COURSES = [
     "Advanced (ICITSS) MCS Course",
     "Advanced (ICITSS) MCS Course - Weekend",
@@ -54,7 +58,7 @@ COURSES = [
     "ICITSS - Orientation Course",
 ]
 
-# Shared lock -- import this in main.py to synchronise file access
+# Shared lock — import this in main.py to synchronise file access
 STATE_LOCK = threading.Lock()
 
 # --- Telegram helpers ---------------------------------------------------------
@@ -173,7 +177,7 @@ def save_state(state: dict):
         logger.error(f"save_state failed: {e}")
 
 def load_batch_state() -> dict:
-    """Load previously seen batch hashes from state.json."""
+    """Load previously seen batch hashes + seat alert history from state.json."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -183,7 +187,7 @@ def load_batch_state() -> dict:
     return {}
 
 def save_batch_state(batch_state: dict):
-    """Persist batch hashes to state.json."""
+    """Persist batch hashes + seat alert history to state.json."""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(batch_state, f, indent=2, ensure_ascii=False)
@@ -210,7 +214,7 @@ def start_setup(chat_id: str, state: dict, message_id=None):
         for i in range(0, len(regions), 2)
     ]
     markup = ikb([[(label, f"region:{label}") for label, _ in row] for row in rows])
-    text = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 -- Select your Region:</b>"
+    text = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 — Select your Region:</b>"
     if message_id:
         edit(chat_id, message_id, text, markup)
     else:
@@ -241,7 +245,7 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
     rows   = [[pous[i], pous[i + 1]] if i + 1 < len(pous) else [pous[i]] for i in range(0, len(pous), 2)]
     markup = ikb([[(label, f"pou:{label}") for label, _ in row] for row in rows])
     edit(chat_id, message_id,
-         f"<b>Step 2 of 3 -- Select your City/PoU</b>\n(Region: {region_label})",
+         f"<b>Step 2 of 3 — Select your City/PoU</b>\n(Region: {region_label})",
          markup)
 
 
@@ -260,7 +264,7 @@ def ask_course(chat_id: str, pou_label: str, state: dict, message_id: int):
 
     markup = ikb([[(c, f"course:{c}")] for c in COURSES])
     edit(chat_id, message_id,
-         f"<b>Step 3 of 3 -- Select your Course</b>\n(City: {pou_label})",
+         f"<b>Step 3 of 3 — Select your Course</b>\n(City: {pou_label})",
          markup)
 
 
@@ -269,13 +273,16 @@ def confirm_subscription(chat_id: str, course: str, state: dict, message_id: int
     region_label = pending.get("region_label")
     pou_label    = pending.get("pou_label")
 
+    # Save subscription (clear pending, mark active, clear registered flag)
     state["users"][chat_id] = {
-        "region":  region_label,
-        "pou":     pou_label,
-        "course":  course,
-        "active":  True,
+        "region":     region_label,
+        "pou":        pou_label,
+        "course":     course,
+        "active":     True,
+        "registered": False,
     }
 
+    # Update the message first with a loading state
     edit(
         chat_id,
         message_id,
@@ -283,9 +290,40 @@ def confirm_subscription(chat_id: str, course: str, state: dict, message_id: int
         f"Region : {region_label}\n"
         f"City    : {pou_label}\n"
         f"Course  : {course}\n\n"
-        f"I'll check every 10 minutes and alert you when batches change.\n\n"
-        f"Commands: /status  /stop  /watch (change preferences)",
+        f"⏳ Fetching current batch details...",
     )
+
+    # Immediately scrape and show current batch status to the new user
+    try:
+        batches = scrape_batches(region_label, pou_label, course)
+        if batches:
+            body = format_batches(batches)
+            send(
+                chat_id,
+                f"<b>📋 Current Batches for {course}</b>\n"
+                f"Region: {region_label} / {pou_label}\n\n"
+                f"{body}\n\n"
+                f"<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
+                f"Register on ICAI portal</a>\n\n"
+                f"I'm monitoring continuously and will alert you when seats drop to "
+                f"<b>15, 10, 5, and 1</b>.\n"
+                f"Once you've registered, send /registered so I stop notifying you.",
+            )
+        else:
+            send(
+                chat_id,
+                f"<b>No batches listed yet</b> for {course} in {pou_label}.\n\n"
+                f"I'm monitoring continuously — you'll be alerted the moment batches appear, "
+                f"and again at <b>15, 10, 5, and 1</b> seats remaining.\n\n"
+                f"Once you've registered, send /registered.",
+            )
+    except Exception as e:
+        logger.error(f"Initial scrape for {chat_id} failed: {e}", exc_info=True)
+        send(
+            chat_id,
+            "Could not fetch current batch data right now, but I'm watching continuously.\n"
+            "You'll be alerted automatically when batches appear or seats change.",
+        )
 
 # --- Command handlers ---------------------------------------------------------
 
@@ -298,13 +336,16 @@ def handle_message(msg: dict, state: dict):
 
     elif text.startswith("/status"):
         u = state["users"].get(chat_id, {})
-        if u.get("active"):
+        if u.get("registered"):
+            send(chat_id, "You've already marked yourself as registered. Use /watch to monitor a new batch.")
+        elif u.get("active"):
             send(
                 chat_id,
                 f"<b>Currently watching:</b>\n\n"
                 f"Region: {u['region']} / {u['pou']}\n"
                 f"Course: {u['course']}\n\n"
-                f"Use /watch to change or /stop to unsubscribe.",
+                f"Alerts fire at 15 / 10 / 5 / 1 seats remaining.\n"
+                f"Use /watch to change, /stop to pause, or /registered once you've enrolled.",
             )
         else:
             send(chat_id, "No active watch. Use /watch to set one up.")
@@ -312,20 +353,63 @@ def handle_message(msg: dict, state: dict):
     elif text.startswith("/stop"):
         if chat_id in state["users"]:
             state["users"][chat_id]["active"] = False
-        send(chat_id, "Alerts stopped. Use /watch anytime to resubscribe.")
+        send(chat_id, "Alerts paused. Use /watch anytime to resubscribe.")
+
+    elif text.lower().startswith("/registered") or text.lower() == "registered":
+        _handle_registered(chat_id, state)
 
     elif text.startswith("/help"):
         send(
             chat_id,
             "<b>ICAI Batch Monitor Bot</b>\n\n"
-            "/watch  -- set up or change your batch alert\n"
-            "/status -- see your current watch\n"
-            "/stop   -- pause alerts\n"
-            "/help   -- this message",
+            "/watch       — set up or change your batch alert\n"
+            "/status      — see your current watch\n"
+            "/stop        — pause alerts\n"
+            "/registered  — I've enrolled! Stop notifying me\n"
+            "/help        — this message\n\n"
+            "<i>You'll be alerted automatically when seats drop to 15, 10, 5, and 1.</i>",
         )
 
     else:
         send(chat_id, "Use /watch to set up your batch alert, or /help for commands.")
+
+
+def _handle_registered(chat_id: str, state: dict):
+    """User has successfully registered — deactivate their watchlist entry."""
+    u = state["users"].get(chat_id, {})
+    if not u or not u.get("active"):
+        send(chat_id, "You don't have an active watch to close. Use /watch to set one up.")
+        return
+
+    region = u.get("region", "")
+    pou    = u.get("pou", "")
+    course = u.get("course", "")
+
+    # Mark as registered & inactive
+    state["users"][chat_id] = {
+        "region":     region,
+        "pou":        pou,
+        "course":     course,
+        "active":     False,
+        "registered": True,
+    }
+
+    # Clean up seat-alert history for this combo so it's fresh on next /watch
+    key = _make_key(region, pou, course)
+    try:
+        batch_state = load_batch_state()
+        if key in batch_state:
+            batch_state[key].pop("seat_alerts_sent", None)
+            save_batch_state(batch_state)
+    except Exception as e:
+        logger.warning(f"Could not clean seat alert state for {key}: {e}")
+
+    send(
+        chat_id,
+        "🎉 <b>Congratulations on registering!</b>\n\n"
+        "Your watchlist is now closed — no more seat alerts for this batch.\n\n"
+        "Use /watch anytime to monitor another batch.",
+    )
 
 
 def handle_callback(cb: dict, state: dict):
@@ -392,6 +476,28 @@ def format_batches(batches: list) -> str:
         )
     return "\n\n".join(lines)
 
+# --- Seat threshold helpers ---------------------------------------------------
+
+def _seats_int(batch: dict):
+    """Return available seats as int, or None if not parseable."""
+    raw = batch.get("Available Seats", batch.get("AvailableSeats", ""))
+    try:
+        return int(str(raw).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _new_threshold_fires(batch: dict, already_sent: list) -> list:
+    """
+    Return thresholds that should fire now but haven't been sent yet.
+    A threshold fires once when seats <= threshold.
+    """
+    seats = _seats_int(batch)
+    if seats is None:
+        return []
+    return [t for t in SEAT_THRESHOLDS if seats <= t and t not in already_sent]
+
+
 # --- Scrape and alert (called by background monitor thread) -------------------
 
 def _make_key(region: str, pou: str, course: str) -> str:
@@ -400,20 +506,22 @@ def _make_key(region: str, pou: str, course: str) -> str:
 
 def scrape_and_alert(state: dict):
     """
-    For every active subscribed user:
+    For every active (non-registered) subscribed user:
       1. Scrape current batches from ICAI
-      2. Compare SHA-256 hash with previously stored value in state.json
-      3. Detect NEW batches via set-difference on Batch No
-      4. Send Telegram alert if changed -- no duplicate notifications
+      2. Alert on any hash change (new/updated batches)
+      3. Independently check seat thresholds (15/10/5/1) and alert per batch
+      4. Skip users who have sent /registered
+      5. Persist updated state to state.json
     """
     users       = state.get("users", {})
     batch_state = load_batch_state()
 
-    # Deduplicate: group users by (region, pou, course) to avoid scraping the
-    # same combo multiple times when multiple users watch the same thing.
-    watchlist: dict = {}   # key -> list of chat_ids
+    # Group users by (region, pou, course) — skip inactive / registered
+    watchlist: dict = {}
     for chat_id, u in users.items():
         if not u.get("active"):
+            continue
+        if u.get("registered"):
             continue
         if "pending" in u:
             continue
@@ -433,62 +541,93 @@ def scrape_and_alert(state: dict):
             logger.error(f"Scrape failed for {key}: {e}", exc_info=True)
             continue
 
-        old_entry    = batch_state.get(key, {})
-        old_hash     = old_entry.get("hash", "")
-        old_batch_nos = {b.get("Batch No", "") for b in old_entry.get("batches", [])}
+        old_entry        = batch_state.get(key, {})
+        old_hash         = old_entry.get("hash", "")
+        old_batch_nos    = {b.get("Batch No", "") for b in old_entry.get("batches", [])}
+        seat_alerts_sent = old_entry.get("seat_alerts_sent", {})  # {batch_no: [thresholds]}
 
-        is_first = old_hash == ""
-        changed  = new_hash != old_hash
+        is_first = (old_hash == "")
+        changed  = (new_hash != old_hash)
 
-        # Update stored state regardless
+        # ── 1. Build seat-threshold alerts ────────────────────────────────────
+        threshold_msgs = []
+        for b in batches:
+            batch_no = str(b.get("Batch No", b.get("BatchNo", "unknown")))
+            already  = seat_alerts_sent.get(batch_no, [])
+            fires    = _new_threshold_fires(b, already)
+            if fires:
+                seats  = _seats_int(b)
+                from_d = b.get("From Date", b.get("FromDate", ""))
+                to_d   = b.get("To Date",   b.get("ToDate",   ""))
+                timing = b.get("Batch Time", b.get("BatchTime", ""))
+                threshold_msgs.append(
+                    f"⚠️ <b>Only {seats} seat(s) left!</b>\n"
+                    f"  Batch <b>{batch_no}</b>  |  {from_d} to {to_d}  |  {timing}"
+                )
+                seat_alerts_sent.setdefault(batch_no, []).extend(fires)
+
+        # ── 2. Persist updated state ──────────────────────────────────────────
         batch_state[key] = {
-            "hash":         new_hash,
-            "batches":      batches,
-            "last_checked": datetime.now(timezone.utc).isoformat(),
-            "region":       region,
-            "pou":          pou,
-            "course":       course,
+            "hash":             new_hash,
+            "batches":          batches,
+            "last_checked":     datetime.now(timezone.utc).isoformat(),
+            "region":           region,
+            "pou":              pou,
+            "course":           course,
+            "seat_alerts_sent": seat_alerts_sent,
         }
 
-        if not changed and not is_first:
-            logger.info(f"  No change ({len(batches)} batch(es))")
-            continue
+        # ── 3. Change-based notifications ────────────────────────────────────
+        if changed or is_first:
+            new_batch_nos   = {b.get("Batch No", "") for b in batches}
+            added_batch_nos = new_batch_nos - old_batch_nos
+            newly_added     = [b for b in batches if b.get("Batch No", "") in added_batch_nos]
+            batches_with_seats = [
+                b for b in batches
+                if str(b.get("Available Seats", b.get("AvailableSeats", "0"))) not in ("0", "")
+            ]
 
-        # Build notification
-        new_batch_nos   = {b.get("Batch No", "") for b in batches}
-        added_batch_nos = new_batch_nos - old_batch_nos  # set-difference logic
-        newly_added     = [b for b in batches if b.get("Batch No", "") in added_batch_nos]
+            if is_first and not batches:
+                logger.info("  First run — no batches yet, baseline saved")
+            else:
+                if batches_with_seats:
+                    header = "🔔 <b>ICAI Batch Update — Seats Available!</b>"
+                    body   = format_batches(batches_with_seats)
+                elif newly_added:
+                    header = "🔔 <b>New ICAI Batches Added</b> (no seats open yet)"
+                    body   = format_batches(newly_added)
+                else:
+                    header = "🔔 <b>ICAI Batch Update</b>"
+                    body   = format_batches(batches)
 
-        batches_with_seats = [
-            b for b in batches
-            if str(b.get("Available Seats", b.get("AvailableSeats", "0"))) not in ("0", "")
-        ]
-
-        if is_first and not batches:
-            logger.info("  First run -- no batches yet, baseline saved")
-            continue
-
-        if batches_with_seats:
-            header = "<b>ICAI Batch Update -- Seats Available!</b>"
-            body   = format_batches(batches_with_seats)
-        elif newly_added:
-            header = "<b>New ICAI Batches Added</b> (no seats yet)"
-            body   = format_batches(newly_added)
+                change_msg = (
+                    f"{header}\n\n"
+                    f"Region : {region} / {pou}\n"
+                    f"Course : {course}\n\n"
+                    f"{body}\n\n"
+                    f"<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
+                    f"Register on ICAI portal →</a>\n\n"
+                    f"Send /registered once you've enrolled."
+                )
+                logger.info(f"  Alerting {len(chat_ids)} user(s) — batch change detected")
+                for chat_id in chat_ids:
+                    send(chat_id, change_msg)
         else:
-            header = "<b>ICAI Batch Update</b>"
-            body   = format_batches(batches)
+            logger.info(f"  No change ({len(batches)} batch(es))")
 
-        msg = (
-            f"{header}\n\n"
-            f"Region : {region} / {pou}\n"
-            f"Course : {course}\n\n"
-            f"{body}\n\n"
-            f"<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
-            f"Register on ICAI portal</a>"
-        )
-
-        logger.info(f"  Alerting {len(chat_ids)} user(s) -- {len(batches_with_seats)} seat(s) open")
-        for chat_id in chat_ids:
-            send(chat_id, msg)
+        # ── 4. Seat-threshold notifications ───────────────────────────────────
+        if threshold_msgs:
+            threshold_alert = (
+                f"🚨 <b>Low Seat Alert</b>\n"
+                f"Region: {region} / {pou}\n"
+                f"Course: {course}\n\n"
+                + "\n\n".join(threshold_msgs) +
+                f"\n\n<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
+                f"Register NOW on ICAI portal →</a>\n\n"
+                f"Send /registered once you've enrolled."
+            )
+            logger.info(f"  Seat-threshold alert → {len(chat_ids)} user(s)")
+            for chat_id in chat_ids:
+                send(chat_id, threshold_alert)
 
     save_batch_state(batch_state)
