@@ -544,8 +544,12 @@ def handle_message(msg: dict, state: dict):
 
 def _handle_registered(chat_id: str, state: dict):
     u = state["users"].get(chat_id, {})
-    if not u or not u.get("active"):
-        send(chat_id, "You don't have an active watch to close. Use /watch to set one up.")
+    # Allow registered even if user did /stop first (active=False but still subscribed)
+    if not u or not u.get("course"):
+        send(chat_id, "You don't have a watch set up. Use /watch to get started.")
+        return
+    if u.get("registered"):
+        send(chat_id, "You've already marked yourself as registered. Use /watch to monitor a new batch.")
         return
 
     region = u.get("region", "")
@@ -591,12 +595,15 @@ def handle_callback(cb: dict, state: dict):
     answer_cb(cb_id)
     state["users"].setdefault(chat_id, {})
 
-    if data.startswith("region:"):
+    pending_step = state["users"].get(chat_id, {}).get("pending", {}).get("step", "")
+
+    if data.startswith("region:") and pending_step == "region":
         ask_pou(chat_id, data[len("region:"):], state, message_id)
-    elif data.startswith("pou:"):
+    elif data.startswith("pou:") and pending_step == "pou":
         ask_course(chat_id, data[len("pou:"):], state, message_id)
-    elif data.startswith("course:"):
+    elif data.startswith("course:") and pending_step == "course":
         confirm_subscription(chat_id, data[len("course:"):], state, message_id)
+    # else: stale button tap from a previous setup flow — ignore silently
 
 
 # --- Poll Telegram updates ----------------------------------------------------
