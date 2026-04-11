@@ -5,7 +5,7 @@ Persistent entry point for the ICAI Telegram Bot.
 
 Runs two concurrent loops:
   1. Telegram polling loop  — checks for user messages every 2 s
-  2. Background monitor     — scrapes ICAI and sends alerts every 10 min
+  2. Background monitor     — scrapes ICAI and sends alerts every 60 s
 
 Deploy on Railway / Render / any VPS:
   railway run python main.py
@@ -22,8 +22,8 @@ from bot import load_state, save_state, process_updates, scrape_and_alert, STATE
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL_SEC   = 2      # how often to check Telegram for new messages
-MONITOR_INTERVAL_SEC = 600   # how often to scrape ICAI (10 minutes)
+POLL_INTERVAL_SEC    = 2    # how often to check Telegram for new messages
+MONITOR_INTERVAL_SEC = 60   # how often to scrape ICAI (1 minute = continuous)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,15 +48,15 @@ signal.signal(signal.SIGINT,  _handle_signal)
 def background_monitor():
     """
     Wakes up every MONITOR_INTERVAL_SEC, scrapes ICAI for every active user,
-    and sends Telegram alerts if new or changed batches are detected.
+    and sends Telegram alerts if batches changed or seat thresholds were crossed.
+    Runs immediately on first iteration (no initial wait).
     """
     logger.info("Background monitor started.")
-    # Run immediately on first wake (don't wait 10 min for first check)
     first_run = True
 
     while not _shutdown.is_set():
         if not first_run:
-            # Sleep in small chunks so we can react to shutdown quickly
+            # Sleep in 1-second chunks so shutdown is responsive
             for _ in range(MONITOR_INTERVAL_SEC):
                 if _shutdown.is_set():
                     break
@@ -102,7 +102,6 @@ def telegram_polling_loop():
         except Exception as e:
             logger.error(f"Polling error: {e}", exc_info=True)
 
-        # Sleep in small chunks so shutdown is responsive
         for _ in range(POLL_INTERVAL_SEC):
             if _shutdown.is_set():
                 break
@@ -117,7 +116,6 @@ def main():
     logger.info("║   ICAI Batch Monitor Bot — starting up   ║")
     logger.info("╚══════════════════════════════════════════╝")
 
-    # Start background monitor as daemon thread
     monitor_thread = threading.Thread(
         target=background_monitor,
         name="BatchMonitor",
@@ -125,7 +123,6 @@ def main():
     )
     monitor_thread.start()
 
-    # Run Telegram polling on the main thread (blocks until shutdown)
     telegram_polling_loop()
 
     logger.info("Main thread exiting. Waiting for monitor thread...")
