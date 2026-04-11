@@ -3,9 +3,6 @@ db.py
 -----
 MongoDB persistence layer for the ICAI Batch Monitor.
 
-Replaces users.json  → collection: 'users'
-         state.json  → collection: 'batch_state'
-
 Collections layout
 ──────────────────
 users:
@@ -18,30 +15,42 @@ batch_state:
 
 heartbeat:
   { _id: "status", last_success: ISO str, last_error: ISO str,
-    error_msg: str, consecutive_failures: int }
+    error_msg: str, consecutive_failures: int, admin_alerted: bool }
 
 Public API
 ──────────
-  load_state()            → dict   {"_offset": int, "users": {chat_id: {...}}}
+  ensure_indexes()
+  load_state()                       → dict
   save_state(state)
-  load_batch_state()      → dict   {key: {...}}
+  load_batch_state()                 → dict
   save_batch_state(batch_state)
   record_heartbeat_ok()
   record_heartbeat_fail(error_msg)
-  get_heartbeat()         → dict
+  get_heartbeat()                    → dict
+  set_heartbeat_admin_alerted(bool)
+  delete_user(chat_id)               → bool
+  delete_stuck_users()               → int
 """
 
 import os
 import logging
 from datetime import datetime, timezone
 
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, UpdateOne, ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError
 
 logger = logging.getLogger(__name__)
 
-_MONGO_URI = os.environ["MONGODB_URI"]
-_DB_NAME   = os.environ.get("MONGODB_DB", "icai_bot")
+# --- Validate env vars at import time with a clear error ----------------------
+
+_MONGO_URI = os.environ.get("MONGODB_URI")
+if not _MONGO_URI:
+    raise EnvironmentError(
+        "MONGODB_URI environment variable is not set. "
+        "Add it to your Railway service variables."
+    )
+
+_DB_NAME = os.environ.get("MONGODB_DB", "icai_bot")
 
 _client = None
 
@@ -49,7 +58,19 @@ _client = None
 def _db():
     global _client
     if _client is None:
-        _client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=10_000)
+        _client = MongoClient(
+            _MONGO_URI,
+            # Connection timeouts
+            serverSelectionTimeoutMS=10_000,
+            connectTimeoutMS=10_000,
+            socketTimeoutMS=30_000,
+            # Automatic retry on transient errors (Atlas default, explicit here)
+            retryWrites=True,
+            retryReads=True,
+            # Connection pool — small pool is fine for a single-process bot
+            maxPoolSize=10,
+            minPoolSize=1,
+        )
     return _client[_DB_NAME]
 
 
@@ -66,7 +87,29 @@ def _heartbeat_col():
 
 
 # ---------------------------------------------------------------------------
-# Users / offset  (replaces users.json)
+# Index management — call once at startup
+# ---------------------------------------------------------------------------
+
+def ensure_indexes():
+    """
+    Create indexes for all collections if they don't already exist.
+    Safe to call on every startup (MongoDB skips existing indexes).
+    """
+    try:
+        # users: queried by active + course in cleanup, and by pending
+        _users_col().create_index([("active", ASCENDING), ("course", ASCENDING)])
+        _users_col().create_index([("pending", ASCENDING)])
+
+        # batch_state: queried by last_checked for monitoring dashboards
+        _batch_col().create_index([("last_checked", DESCENDING)])
+
+        logger.info("[DB] Indexes ensured.")
+    except PyMongoError as e:
+        logger.warning(f"ensure_indexes failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Users / offset
 # ---------------------------------------------------------------------------
 
 def load_state() -> dict:
@@ -117,7 +160,7 @@ def save_state(state: dict):
 
 
 # ---------------------------------------------------------------------------
-# Batch state  (replaces state.json)
+# Batch state
 # ---------------------------------------------------------------------------
 
 def load_batch_state() -> dict:
@@ -154,11 +197,10 @@ def save_batch_state(batch_state: dict):
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat  (scraper health tracking)
+# Heartbeat
 # ---------------------------------------------------------------------------
 
 def record_heartbeat_ok():
-    """Call this after every successful scrape cycle."""
     try:
         _heartbeat_col().update_one(
             {"_id": "status"},
@@ -175,7 +217,6 @@ def record_heartbeat_ok():
 
 
 def record_heartbeat_fail(error_msg: str):
-    """Call this when a scrape cycle throws an exception."""
     try:
         _heartbeat_col().update_one(
             {"_id": "status"},
@@ -197,3 +238,59 @@ def get_heartbeat() -> dict:
     except PyMongoError as e:
         logger.error(f"get_heartbeat DB error: {e}")
         return {}
+
+
+def set_heartbeat_admin_alerted(value: bool):
+    """Set or clear the admin_alerted flag after sending/clearing an alert."""
+    try:
+        _heartbeat_col().update_one(
+            {"_id": "status"},
+            {"$set": {"admin_alerted": value}},
+            upsert=True,
+        )
+    except PyMongoError as e:
+        logger.error(f"set_heartbeat_admin_alerted DB error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# User management helpers
+# ---------------------------------------------------------------------------
+
+def delete_user(chat_id: str) -> bool:
+    """Fully remove a user document. Returns True if a document was deleted."""
+    try:
+        result = _users_col().delete_one({"_id": chat_id})
+        return result.deleted_count > 0
+    except PyMongoError as e:
+        logger.error(f"delete_user DB error (chat_id={chat_id}): {e}")
+        return False
+
+
+def delete_stuck_users() -> int:
+    """
+    Remove user documents that are stuck mid-setup or are dead entries.
+    Returns the total number of documents deleted.
+    """
+    try:
+        col = _users_col()
+
+        # Stuck mid-setup: has a 'pending' key but no 'course' yet
+        result1 = col.delete_many({
+            "pending": {"$exists": True},
+            "course":  {"$exists": False},
+            "_id":     {"$ne": "__meta__"},
+        })
+
+        # Dead entries: inactive, not registered, and no course
+        result2 = col.delete_many({
+            "active":     False,
+            "registered": {"$in": [False, None]},
+            "course":     {"$exists": False},
+            "_id":        {"$ne": "__meta__"},
+        })
+
+        return result1.deleted_count + result2.deleted_count
+
+    except PyMongoError as e:
+        logger.error(f"delete_stuck_users DB error: {e}")
+        return 0
