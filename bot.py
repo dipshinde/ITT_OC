@@ -338,16 +338,20 @@ def fetch_pous(region_value: str):
 
 def start_setup(chat_id: str, state: dict, message_id=None):
     """Begin the Region -> PoU -> Course selection flow."""
-    # FIX 2: lock the user while we do the network call
     if _is_processing(chat_id, state):
-        send(chat_id, "⏳ Still loading, please wait a moment...")
+        # Already locked — drop duplicate silently, no spam
         return
 
+    # Persist lock to DB immediately so next poll cycle (which reloads state
+    # from MongoDB) also sees processing=True and drops the duplicate request.
     _set_processing(chat_id, state, True)
+    save_state(state)
+
     try:
         regions = fetch_regions()
     finally:
         _set_processing(chat_id, state, False)
+        save_state(state)
 
     if not regions:
         send(chat_id, "Could not reach the ICAI site. Please try again in a minute.")
@@ -372,9 +376,8 @@ def start_setup(chat_id: str, state: dict, message_id=None):
 
 
 def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
-    # FIX 2: lock check
     if _is_processing(chat_id, state):
-        answer_cb("", "Still loading, please wait...")
+        answer_cb(message_id, "⏳ Still loading, please wait...")
         return
 
     pending      = state["users"][chat_id].get("pending", {})
@@ -385,11 +388,14 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
         send(chat_id, "Region not recognised. Type /watch to restart.")
         return
 
+    # Persist lock before slow network call (same reason as start_setup)
     _set_processing(chat_id, state, True)
+    save_state(state)
     try:
         pous = fetch_pous(region_value)
     finally:
         _set_processing(chat_id, state, False)
+        save_state(state)
 
     if not pous:
         send(chat_id, "Could not fetch city list. Type /watch to try again.")
@@ -489,8 +495,8 @@ def handle_message(msg: dict, state: dict):
     text    = msg.get("text", "").strip()
 
     # FIX 2: block commands while a setup step is in-flight
-    if _is_processing(chat_id, state) and not text.startswith("/start"):
-        send(chat_id, "⏳ Processing your previous request, please wait...")
+    if _is_processing(chat_id, state):
+        # Drop silently — start_setup will send the region keyboard once done
         return
 
     if text.startswith("/start") or text.startswith("/watch"):
