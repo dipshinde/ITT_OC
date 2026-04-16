@@ -6,6 +6,12 @@ Handles the full ASP.NET WebForms postback chain for the ICAI batch listing page
 FIX: compute_hash now sorts the batch list before hashing so that identical
      batches returned in different row order do NOT trigger false change alerts.
 
+FIX: compute_structural_hash added — ignores seat-count fields so that a drop
+     from 20→19 seats does NOT trigger a 'Batch Update' notification. Only
+     structural changes (new batches, date/timing changes, batch removal) will
+     fire the change alert. Seat-count alerts are handled separately via
+     thresholds in bot.py.
+
 FIX: Diagnostic dump functions (_dump_all_selects, _dump_page_snippet) now
      emit at DEBUG level so Railway logs aren't flooded every 60 seconds.
      Set LOG_LEVEL=DEBUG in your Railway env vars to re-enable them.
@@ -36,6 +42,15 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
     "Cache-Control":           "max-age=0",
 }
+
+# Fields that contain seat counts — excluded from the structural hash so that
+# seat-count fluctuations do not trigger false "Batch Update" alerts.
+SEAT_FIELDS: frozenset = frozenset({
+    "Available Seats", "AvailableSeats",
+    "Seats Available", "Seats",
+    "available seats", "availableseats",
+    "seats available",
+})
 
 
 # ─── Diagnostic helpers (DEBUG level — silent in production) ──────────────────
@@ -300,15 +315,44 @@ def _parse_batch_table(soup: BeautifulSoup) -> list[dict]:
 
 def compute_hash(batches: list[dict]) -> str:
     """
-    Stable hash of a batch list.
+    Stable hash of a batch list (includes seat counts).
 
     FIX: The list is sorted by (Batch No, From Date) before serialising so
     that identical batches returned in a different row order by ICAI's server
     do NOT produce a different hash and therefore do NOT trigger false
     'Batch Update' alerts.
+
+    NOTE: Use compute_structural_hash() for change-based notifications so
+    that seat-count fluctuations don't send spam alerts to users.
     """
     sorted_batches = sorted(
         batches,
+        key=lambda b: (
+            str(b.get("Batch No",   b.get("BatchNo",   ""))),
+            str(b.get("From Date",  b.get("FromDate",  ""))),
+        )
+    )
+    serialized = json.dumps(sorted_batches, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def compute_structural_hash(batches: list[dict]) -> str:
+    """
+    Stable hash of batch structure, IGNORING seat-count fields.
+
+    Use this for change-based notifications so that a drop from 20→19 seats
+    does NOT trigger a spurious 'Batch Update' alert. Only structural changes
+    (new batches added, dates/timing changed, batches removed) will produce a
+    different hash and trigger the change notification.
+
+    Seat-count alerts are handled independently via SEAT_THRESHOLDS in bot.py.
+    """
+    stripped = [
+        {k: v for k, v in b.items() if k not in SEAT_FIELDS}
+        for b in batches
+    ]
+    sorted_batches = sorted(
+        stripped,
         key=lambda b: (
             str(b.get("Batch No",   b.get("BatchNo",   ""))),
             str(b.get("From Date",  b.get("FromDate",  ""))),
