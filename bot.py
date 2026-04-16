@@ -7,50 +7,62 @@ Responsibilities:
   - User onboarding flow: Region -> PoU -> Course (inline keyboard)
   - Command handling: /start /watch /status /stop /registered /help
   - scrape_and_alert(): called by background monitor thread every 60 s
-  - Seat-threshold alerts: notifies at 15 / 10 / 5 / 1 seats remaining
+  - Seat-threshold alerts: notifies at 10 / 5 / 1 seats remaining
   - State persistence: MongoDB via db.py
 
 Fixes applied
 ─────────────
-  1. HASH STABILITY    — compute_hash now sorts the batch list so identical
-                         data in different row order does NOT trigger false alerts.
-                         (Fix lives in scraper.py)
+  1. MULTI-BATCH TRACKING — each user now has a `watchlist` array allowing
+                             them to track multiple Region/PoU/Course combos
+                             simultaneously. /watch always adds a new watch.
+                             /stop and /registered show a selection keyboard
+                             when the user has multiple watches.
 
-  2. HTML ESCAPING     — all scraped strings passed to Telegram HTML messages are
-                         escaped with html.escape() so special chars (&, <, >)
-                         don't corrupt the message or cause Telegram to reject it.
+  2. SEAT-SPAM FIX       — change-based "Batch Update" notifications now use
+                            compute_structural_hash() (which ignores seat counts)
+                            instead of compute_hash(). A drop from 20→19 seats
+                            no longer triggers a change alert. Seat-count
+                            alerts only fire at the configured thresholds.
 
-  3. THREAD SAFETY     — scrape_and_alert() takes a deep copy of the users dict
-                         inside STATE_LOCK before iterating, preventing
-                         RuntimeError: dictionary changed size during iteration
-                         and ensuring the monitor never alerts already-stopped users.
+  3. SEAT THRESHOLDS     — changed from [15, 10, 5, 1] to [10, 5, 1].
+                            Alert at 15 seats removed per product decision.
 
-  4. CONCURRENT SCRAPE — all unique watchlist keys are scraped in parallel using
-                         ThreadPoolExecutor (max 4 workers) so the 60-second
-                         cycle doesn't blow out with many subscribers.
+  4. ZERO-SEAT GUARD     — _new_threshold_fires() now returns [] when
+                            seats <= 0, preventing notifications for batches
+                            with zero (or negative) available seats.
 
-  5. SEAT ALERT RESET  — seat_alerts_sent entries for batches that disappeared
-                         from ICAI are pruned each cycle so the same batch number
-                         reused in the next season correctly fires new alerts.
+  5. HASH STABILITY      — compute_hash sorts the batch list so identical
+                           data in different row order does NOT trigger alerts.
+                           (Fix lives in scraper.py)
 
-  6. MESSAGE QUEUE     — _MSG_QUEUE now has maxsize=2000. If the queue is full
-                         (Telegram outage), messages are dropped with a warning
-                         rather than consuming unbounded memory.
+  6. HTML ESCAPING       — all scraped strings passed to Telegram HTML messages
+                           are escaped with html.escape().
 
-  7. MEMORY LEAK       — _last_sent_per_chat is pruned when a user is deleted,
-                         preventing unbounded growth over months of operation.
+  7. THREAD SAFETY       — scrape_and_alert() takes a deep copy of the users
+                           dict inside STATE_LOCK before iterating.
 
-  8. STUCK PROCESSING  — _reset_stuck_processing() clears processing=True flags
-                         left over from a Railway restart mid-flow. Called once
-                         at startup from main.py.
+  8. CONCURRENT SCRAPE   — all unique watchlist keys scraped in parallel using
+                           ThreadPoolExecutor (max 4 workers).
 
-  9. ASYNC SETUP SCRAPE — the initial scrape in confirm_subscription() is moved
-                          to a background thread so the polling loop is never
-                          blocked for 5-15 seconds during user onboarding.
+  9. SEAT ALERT RESET    — seat_alerts_sent entries for batches that disappeared
+                           are pruned each cycle so re-used batch numbers fire
+                           fresh alerts next season.
 
- 10. CLEAN PUBLIC API  — inline `from db import _private_col` calls replaced with
-                         proper public functions (delete_user, delete_stuck_users,
-                         set_heartbeat_admin_alerted) defined in db.py.
+ 10. MESSAGE QUEUE       — _MSG_QUEUE has maxsize=2000; messages are dropped
+                           with a warning rather than consuming unbounded memory.
+
+ 11. MEMORY LEAK         — _last_sent_per_chat is pruned when a user is deleted.
+
+ 12. STUCK PROCESSING    — _reset_stuck_processing() clears processing=True
+                           flags left over from a Railway restart mid-flow.
+
+ 13. ASYNC SETUP SCRAPE  — initial scrape in confirm_subscription() runs in a
+                           background thread so polling loop is never blocked.
+
+ 14. USER MIGRATION      — migrate_users_to_watchlist() converts old single-
+                           watch user docs (region/pou/course at top level) to
+                           the new watchlist-array format. Called once at startup
+                           from main.py.
 
 Thread safety: all state I/O is wrapped in STATE_LOCK (defined here,
 imported by main.py for synchronisation with the background monitor).
@@ -69,7 +81,7 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 
-from scraper import scrape_batches, compute_hash
+from scraper import scrape_batches, compute_hash, compute_structural_hash
 from db import (
     load_state, save_state,
     load_batch_state, save_batch_state,
@@ -107,7 +119,8 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
 HEARTBEAT_FAIL_THRESHOLD = 3
 
-SEAT_THRESHOLDS = [15, 10, 5, 1]
+# FIX: removed 15 from thresholds per product decision; alert only at 10, 5, 1
+SEAT_THRESHOLDS = [10, 5, 1]
 
 COURSES = [
     "Advanced (ICITSS) MCS Course",
@@ -125,8 +138,6 @@ STATE_LOCK = threading.Lock()
 # MESSAGE QUEUE — rate-limited outbox
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# maxsize=2000: if Telegram is down for an extended period, messages are dropped
-# (with a warning log) rather than consuming unbounded memory.
 _MSG_QUEUE: queue.Queue = queue.Queue(maxsize=2000)
 _GLOBAL_SEND_DELAY  = 0.05   # ≈ 20 msg/s global
 _PER_CHAT_DELAY     = 1.1    # 1 msg/s per chat
@@ -176,7 +187,7 @@ def _queue_worker():
                     retry_after = result.get("parameters", {}).get("retry_after", 5)
                     logger.warning(f"Telegram 429 — retrying after {retry_after}s (chat {chat_id})")
                     time.sleep(retry_after)
-                    _enqueue(method, payload)   # re-queue via _enqueue (respects maxsize)
+                    _enqueue(method, payload)
                 else:
                     logger.error(f"Telegram {method} failed: {result}")
         except requests.RequestException as e:
@@ -254,6 +265,54 @@ def _set_processing(chat_id: str, state: dict, value: bool):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST HELPERS — multi-watch support
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_watchlist(u: dict) -> list:
+    """
+    Return a user's watchlist, transparently handling the old single-watch
+    format where region/pou/course were stored at the top level of the user doc.
+    Always returns a list of dicts with keys: region, pou, course, registered.
+    """
+    if "watchlist" in u:
+        return u["watchlist"]
+    # Old single-watch format migration (read-only view; actual migration done at startup)
+    if u.get("region") and u.get("pou") and u.get("course"):
+        return [{
+            "region":     u["region"],
+            "pou":        u["pou"],
+            "course":     u["course"],
+            "registered": u.get("registered", False),
+        }]
+    return []
+
+
+def migrate_users_to_watchlist(state: dict) -> bool:
+    """
+    One-time startup migration: convert old single-watch user docs
+    (region/pou/course stored at top level) to the new watchlist-array format.
+
+    Returns True if any user was migrated so the caller can persist the change.
+    Called once from main.py after loading state.
+    """
+    changed = False
+    for uid, u in state.get("users", {}).items():
+        if uid == "__meta__":
+            continue
+        if "watchlist" not in u and u.get("region") and u.get("pou") and u.get("course"):
+            u["watchlist"] = [{
+                "region":     u.pop("region"),
+                "pou":        u.pop("pou"),
+                "course":     u.pop("course"),
+                "registered": u.pop("registered", False),
+            }]
+            u.setdefault("active", True)
+            changed = True
+            logger.info(f"[Migration] Migrated user {uid} to watchlist format")
+    return changed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STARTUP HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -278,10 +337,6 @@ def _reset_stuck_processing(state: dict) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _check_and_alert_heartbeat():
-    """
-    If consecutive failures >= threshold, send a one-time Telegram alert to
-    ADMIN_CHAT_ID. Only alerts once per failure streak (admin_alerted flag).
-    """
     if not ADMIN_CHAT_ID:
         return
 
@@ -325,26 +380,20 @@ def _delete_user(chat_id: str, state: dict):
     """
     state["users"].pop(chat_id, None)
     delete_user(chat_id)
-    # FIX: prune the rate-limiter dict so it doesn't grow forever
     with _queue_lock:
         _last_sent_per_chat.pop(chat_id, None)
     logger.info(f"Deleted user {chat_id} from state and MongoDB.")
 
 
 def cleanup_stuck_users(state: dict):
-    """
-    Runs daily at 1:00 AM IST. Deletes stuck/dead user documents from MongoDB
-    and syncs the in-memory state.
-    """
     logger.info("[Daily Cleanup] Running stuck-user cleanup...")
     try:
         total = delete_stuck_users()
         logger.info(f"[Daily Cleanup] Removed {total} stale user document(s) from MongoDB.")
 
-        # Sync: remove any purged users from the in-memory state dict
         purged_keys = [
             uid for uid, u in list(state.get("users", {}).items())
-            if "pending" in u and "course" not in u
+            if "pending" in u and "course" not in u and "watchlist" not in u
         ]
         for uid in purged_keys:
             state["users"].pop(uid, None)
@@ -363,15 +412,10 @@ def cleanup_stuck_users(state: dict):
 
 
 def start_cleanup_scheduler(state: dict):
-    """
-    Starts a background daemon thread that runs cleanup_stuck_users()
-    every day at 1:00 AM IST (= 19:30 UTC).
-    """
     def _scheduler():
         logger.info("Daily cleanup scheduler started — will run at 1:00 AM IST every day.")
         while True:
             now_utc = datetime.now(timezone.utc)
-            # 1:00 AM IST = UTC+5:30 = 19:30 UTC previous day
             target_hour, target_minute = 19, 30
             next_run = now_utc.replace(
                 hour=target_hour, minute=target_minute, second=0, microsecond=0
@@ -477,11 +521,23 @@ def start_setup(chat_id: str, state: dict, message_id=None):
         for i in range(0, len(regions), 2)
     ]
     markup = ikb([[(label, f"region:{label}") for label, _ in row] for row in rows])
-    text   = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 — Select your Region:</b>"
-    if message_id:
-        edit(chat_id, message_id, text, markup)
+
+    # Show different prompt if user already has watches
+    existing = _get_watchlist(state["users"].get(chat_id, {}))
+    active_count = sum(1 for w in existing if not w.get("registered"))
+    if active_count > 0:
+        intro = (
+            f"You're already watching <b>{active_count}</b> batch(es). "
+            f"Let's add another one!\n\n"
+            f"<b>Step 1 of 3 — Select your Region:</b>"
+        )
     else:
-        send(chat_id, text, markup)
+        intro = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 — Select your Region:</b>"
+
+    if message_id:
+        edit(chat_id, message_id, intro, markup)
+    else:
+        send(chat_id, intro, markup)
 
 
 def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
@@ -545,8 +601,7 @@ def ask_course(chat_id: str, pou_label: str, state: dict, message_id: int):
 def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, course: str):
     """
     Background thread: fetch current batches right after a user subscribes
-    and send them an immediate snapshot. Runs outside the polling loop so it
-    never blocks other users' messages.
+    and send them an immediate snapshot.
     """
     try:
         batches = scrape_batches(region_label, pou_label, course)
@@ -560,7 +615,7 @@ def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, cour
                 f"<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
                 f"Register on ICAI portal</a>\n\n"
                 f"I'm monitoring continuously and will alert you when seats drop to "
-                f"<b>15, 10, 5, and 1</b>.\n"
+                f"<b>10, 5, and 1</b>.\n"
                 f"Once you've registered, send /registered so I stop notifying you.",
             )
         else:
@@ -568,7 +623,7 @@ def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, cour
                 chat_id,
                 f"<b>No batches listed yet</b> for {html.escape(course)} in {html.escape(pou_label)}.\n\n"
                 f"I'm monitoring continuously — you'll be alerted the moment batches appear, "
-                f"and again at <b>15, 10, 5, and 1</b> seats remaining.\n\n"
+                f"and again at <b>10, 5, and 1</b> seats remaining.\n\n"
                 f"Once you've registered, send /registered.",
             )
     except Exception as e:
@@ -576,7 +631,7 @@ def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, cour
         send(
             chat_id,
             "Could not fetch current batch data right now, but I'm watching continuously.\n"
-            "You'll be alerted automatically when batches appear or seats change.",
+            "You'll be alerted automatically when batches appear or seats hit 10, 5, or 1.",
         )
 
 
@@ -585,25 +640,64 @@ def confirm_subscription(chat_id: str, course: str, state: dict, message_id: int
     region_label = pending.get("region_label")
     pou_label    = pending.get("pou_label")
 
-    state["users"][chat_id] = {
-        "region":     region_label,
-        "pou":        pou_label,
-        "course":     course,
-        "active":     True,
-        "registered": False,
-    }
+    u = state["users"].setdefault(chat_id, {})
 
+    # Ensure new watchlist format — migrate old format if present
+    if "watchlist" not in u:
+        if u.get("region") and u.get("pou") and u.get("course"):
+            u["watchlist"] = [{
+                "region":     u.pop("region"),
+                "pou":        u.pop("pou"),
+                "course":     u.pop("course"),
+                "registered": u.pop("registered", False),
+            }]
+        else:
+            u["watchlist"] = []
+
+    # Prevent duplicate watches
+    is_duplicate = any(
+        w.get("region") == region_label
+        and w.get("pou") == pou_label
+        and w.get("course") == course
+        for w in u["watchlist"]
+    )
+
+    if not is_duplicate:
+        u["watchlist"].append({
+            "region":     region_label,
+            "pou":        pou_label,
+            "course":     course,
+            "registered": False,
+        })
+
+    u["active"] = True
+    u.pop("pending",     None)
+    # Clean up any stale old-format top-level fields
+    u.pop("region",     None)
+    u.pop("pou",        None)
+    u.pop("course",     None)
+    u.pop("registered", None)
+
+    if is_duplicate:
+        edit(
+            chat_id, message_id,
+            f"<b>Already watching!</b>\n\n"
+            f"You're already monitoring <b>{html.escape(course)}</b> in {html.escape(pou_label)}.\n\n"
+            f"Use /status to see all your active watches.",
+        )
+        return
+
+    total_watches = sum(1 for w in u["watchlist"] if not w.get("registered"))
     edit(
         chat_id, message_id,
-        f"<b>You're all set!</b>\n\n"
+        f"<b>✅ Watch added!</b>\n\n"
         f"Region : {html.escape(region_label)}\n"
         f"City    : {html.escape(pou_label)}\n"
         f"Course  : {html.escape(course)}\n\n"
+        f"You're now tracking <b>{total_watches}</b> batch(es) total.\n\n"
         f"⏳ Fetching current batch details...",
     )
 
-    # FIX: run the initial scrape in a background thread so the polling loop
-    # is never blocked for 5-15 seconds while ICAI's server responds.
     threading.Thread(
         target=_initial_scrape_notify,
         args=(chat_id, region_label, pou_label, course),
@@ -626,22 +720,46 @@ def handle_message(msg: dict, state: dict):
 
     elif text.startswith("/status"):
         u = state["users"].get(chat_id, {})
-        if u.get("active"):
+        watches = _get_watchlist(u)
+        active_watches = [w for w in watches if not w.get("registered")]
+        if active_watches:
+            lines = "\n\n".join(
+                f"<b>{i + 1}.</b> {html.escape(w['region'])} / {html.escape(w['pou'])}\n"
+                f"   Course: {html.escape(w['course'])}"
+                for i, w in enumerate(active_watches)
+            )
             send(
                 chat_id,
-                f"<b>Currently watching:</b>\n\n"
-                f"Region: {html.escape(u['region'])} / {html.escape(u['pou'])}\n"
-                f"Course: {html.escape(u['course'])}\n\n"
-                f"Alerts fire at 15 / 10 / 5 / 1 seats remaining.\n"
-                f"Use /watch to change, /stop to pause, or /registered once you've enrolled.",
+                f"<b>Currently watching {len(active_watches)} batch(es):</b>\n\n"
+                f"{lines}\n\n"
+                f"Alerts fire at <b>10 / 5 / 1</b> seats remaining.\n"
+                f"Use /watch to add more, /stop to remove one, "
+                f"or /registered once you've enrolled.",
             )
         else:
-            send(chat_id, "No active watch. Use /watch to set one up.")
+            send(chat_id, "No active watches. Use /watch to set one up.")
 
     elif text.startswith("/stop"):
-        if chat_id in state["users"]:
+        u = state["users"].get(chat_id, {})
+        watches = _get_watchlist(u)
+        active_watches = [(i, w) for i, w in enumerate(watches) if not w.get("registered")]
+
+        if not active_watches:
+            send(chat_id, "You don't have any active watches. Use /watch to set one up.")
+        elif len(active_watches) == 1:
             _delete_user(chat_id, state)
-        send(chat_id, "Alerts paused. Use /watch anytime to resubscribe.")
+            send(chat_id, "Watch stopped. Use /watch anytime to resubscribe.")
+        else:
+            rows = [
+                [(
+                    f"{html.escape(w['pou'])} — {w['course'][:35]}",
+                    f"stop_watch:{orig_i}"
+                )]
+                for orig_i, w in active_watches
+            ]
+            rows.append([("🛑 Stop All Watches", "stop_watch:all")])
+            markup = ikb(rows)
+            send(chat_id, "<b>Which watch would you like to stop?</b>", markup)
 
     elif text.lower().startswith("/registered") or text.lower() == "registered":
         _handle_registered(chat_id, state)
@@ -650,45 +768,101 @@ def handle_message(msg: dict, state: dict):
         send(
             chat_id,
             "<b>ICAI Batch Monitor Bot</b>\n\n"
-            "/watch       — set up or change your batch alert\n"
-            "/status      — see your current watch\n"
-            "/stop        — pause alerts\n"
+            "/watch       — add a new batch to monitor\n"
+            "/status      — see all your current watches\n"
+            "/stop        — stop one or all watches\n"
             "/registered  — I've enrolled! Stop notifying me\n"
             "/help        — this message\n\n"
-            "<i>You'll be alerted automatically when seats drop to 15, 10, 5, and 1.</i>",
+            "<i>You can track multiple Region/City/Course combinations at once.\n"
+            "Seat alerts fire at 10, 5, and 1 remaining seats.</i>",
         )
 
     else:
-        send(chat_id, "Use /watch to set up your batch alert, or /help for commands.")
+        send(chat_id, "Use /watch to set up a batch alert, or /help for all commands.")
 
 
 def _handle_registered(chat_id: str, state: dict):
     u = state["users"].get(chat_id, {})
-    if not u or not u.get("course"):
-        send(chat_id, "You don't have a watch set up. Use /watch to get started.")
+    watches = _get_watchlist(u)
+    active_watches = [(i, w) for i, w in enumerate(watches) if not w.get("registered")]
+
+    if not active_watches:
+        send(chat_id, "You don't have any active watches. Use /watch to get started.")
         return
 
-    region = u.get("region", "")
-    pou    = u.get("pou",    "")
-    course = u.get("course", "")
+    if len(active_watches) == 1:
+        orig_idx, _ = active_watches[0]
+        _remove_registered_watch(chat_id, orig_idx, state)
+    else:
+        rows = [
+            [(
+                f"{html.escape(w['pou'])} — {w['course'][:35]}",
+                f"reg_watch:{orig_i}"
+            )]
+            for j, (orig_i, w) in enumerate(active_watches)
+        ]
+        markup = ikb(rows)
+        send(
+            chat_id,
+            "<b>Which batch did you register for?</b>\n\n"
+            "Select the course you enrolled in and I'll stop monitoring it for you.",
+            markup,
+        )
 
-    _delete_user(chat_id, state)
 
-    # Clean up seat alert state for this key
+def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
+    """
+    Remove a single watch from the user's watchlist (used after /registered).
+    Deletes the user entirely if no watches remain.
+    """
+    u = state["users"].get(chat_id, {})
+    if not u:
+        send(chat_id, "No watches found. Use /watch to get started.")
+        return
+
+    watches = list(_get_watchlist(u))
+    if watch_idx < 0 or watch_idx >= len(watches):
+        send(chat_id, "Watch not found. Use /status to see your current watches.")
+        return
+
+    watch  = watches.pop(watch_idx)
+    region = watch.get("region", "")
+    pou    = watch.get("pou",    "")
+    course = watch.get("course", "")
+
+    if watches:
+        u["watchlist"] = watches
+        # Clean up any stale old-format fields
+        u.pop("region", None)
+        u.pop("pou",    None)
+        u.pop("course", None)
+        save_state(state)
+    else:
+        _delete_user(chat_id, state)
+
+    # Clean up seat alert state for the removed key
     key = _make_key(region, pou, course)
     try:
-        batch_state = load_batch_state()
-        if key in batch_state:
-            batch_state[key].pop("seat_alerts_sent", None)
-            save_batch_state(batch_state)
+        batch_state_data = load_batch_state()
+        if key in batch_state_data:
+            batch_state_data[key].pop("seat_alerts_sent", None)
+            save_batch_state(batch_state_data)
     except Exception as e:
         logger.warning(f"Could not clean seat alert state for {key}: {e}")
 
+    remaining = len(watches)
+    if remaining:
+        extra = (
+            f"\n\nYou still have <b>{remaining}</b> watch(es) active. "
+            f"Use /status to see them."
+        )
+    else:
+        extra = "\n\nUse /watch anytime to monitor another batch."
+
     send(
         chat_id,
-        "🎉 <b>Congratulations on registering!</b>\n\n"
-        "Your watchlist is now closed — no more seat alerts for this batch.\n\n"
-        "Use /watch anytime to monitor another batch.",
+        f"🎉 <b>Congratulations on registering!</b>\n\n"
+        f"Removed watch for <b>{html.escape(course)}</b> in {html.escape(pou)}.{extra}",
     )
 
 
@@ -707,12 +881,63 @@ def handle_callback(cb: dict, state: dict):
 
     pending_step = state["users"].get(chat_id, {}).get("pending", {}).get("step", "")
 
+    # ── Setup flow callbacks ──────────────────────────────────────────────────
     if data.startswith("region:") and pending_step == "region":
         ask_pou(chat_id, data[len("region:"):], state, message_id)
+
     elif data.startswith("pou:") and pending_step == "pou":
         ask_course(chat_id, data[len("pou:"):], state, message_id)
+
     elif data.startswith("course:") and pending_step == "course":
         confirm_subscription(chat_id, data[len("course:"):], state, message_id)
+
+    # ── Stop-watch callbacks (multi-watch /stop) ──────────────────────────────
+    elif data.startswith("stop_watch:"):
+        idx_str = data[len("stop_watch:"):]
+        if idx_str == "all":
+            _delete_user(chat_id, state)
+            send(chat_id, "All watches stopped. Use /watch anytime to resubscribe.")
+        else:
+            try:
+                idx = int(idx_str)
+                u   = state["users"].get(chat_id, {})
+                watches = list(_get_watchlist(u))
+                if 0 <= idx < len(watches):
+                    removed = watches.pop(idx)
+                    if watches:
+                        u["watchlist"] = watches
+                        u.pop("region", None)
+                        u.pop("pou",    None)
+                        u.pop("course", None)
+                        save_state(state)
+                        send(
+                            chat_id,
+                            f"✅ Stopped watching <b>{html.escape(removed.get('course', ''))}</b> "
+                            f"in {html.escape(removed.get('pou', ''))}.\n\n"
+                            f"You have <b>{len(watches)}</b> watch(es) remaining. "
+                            f"Use /status to review them.",
+                        )
+                    else:
+                        _delete_user(chat_id, state)
+                        send(chat_id, "All watches removed. Use /watch anytime to resubscribe.")
+                else:
+                    send(chat_id, "Watch not found. Use /status to check your current watches.")
+            except (ValueError, KeyError) as e:
+                logger.error(f"stop_watch callback error: {e}")
+                send(chat_id, "Something went wrong. Please try /stop again.")
+
+    # ── Registered callbacks (multi-watch /registered) ────────────────────────
+    elif data.startswith("reg_watch:"):
+        try:
+            idx = int(data[len("reg_watch:"):])
+            u   = state["users"].get(chat_id, {})
+            watches = _get_watchlist(u)
+            if 0 <= idx < len(watches):
+                _remove_registered_watch(chat_id, idx, state)
+            else:
+                send(chat_id, "Watch not found. Use /status to check your current watches.")
+        except ValueError:
+            send(chat_id, "Something went wrong. Please try /registered again.")
 
 
 # --- Poll Telegram updates ----------------------------------------------------
@@ -781,8 +1006,14 @@ def _seats_int(batch: dict):
 
 
 def _new_threshold_fires(batch: dict, already_sent: list) -> list:
+    """
+    Return the subset of SEAT_THRESHOLDS that should fire for this batch.
+
+    FIX: returns [] when seats <= 0 — prevents zero-seat notifications.
+    FIX: SEAT_THRESHOLDS is now [10, 5, 1] — removed the 15-seat alert.
+    """
     seats = _seats_int(batch)
-    if seats is None:
+    if seats is None or seats <= 0:   # guard: never alert on 0 or negative seats
         return []
     return [t for t in SEAT_THRESHOLDS if seats <= t and t not in already_sent]
 
@@ -796,35 +1027,36 @@ def _make_key(region: str, pou: str, course: str) -> str:
 def scrape_and_alert(state: dict):
     """
     For every active subscribed user:
-      1. Scrape current batches from ICAI (all keys in parallel)
-      2. Alert on any hash change (new/updated batches)
-      3. Independently check seat thresholds (15/10/5/1) and alert per batch
-      4. Persist updated batch state to MongoDB
-
-    FIX: Takes a deep copy of state["users"] under STATE_LOCK before iterating
-         so the monitor thread never races with the polling thread's mutations.
-
-    FIX: Uses ThreadPoolExecutor so multiple unique Region/PoU/Course
-         combinations are scraped concurrently (max 4 workers), keeping
-         the 60-second cycle from ballooning with many subscribers.
+      1. Collect all unique watchlist keys (supports multiple watches per user)
+      2. Scrape current batches from ICAI (all keys in parallel)
+      3. Alert on structural changes (new/removed batches, date/timing changes)
+         — does NOT alert on seat-count-only changes (FIX for spam issue)
+      4. Independently check seat thresholds (10/5/1) and alert per batch
+         — never fires for 0-seat batches (FIX for zero-seat alert issue)
+      5. Persist updated batch state to MongoDB
     """
-    # Take a stable snapshot — never iterate the live dict
     with STATE_LOCK:
         users_snapshot = copy.deepcopy(state.get("users", {}))
 
     batch_state = load_batch_state()
 
     # Build watchlist: unique key → list of chat_ids
+    # Handles both old single-watch format and new watchlist array format
     watchlist: dict = {}
     for chat_id, u in users_snapshot.items():
         if not u.get("active"):
             continue
         if "pending" in u:
             continue
-        if not (u.get("region") and u.get("pou") and u.get("course")):
-            continue
-        key = _make_key(u["region"], u["pou"], u["course"])
-        watchlist.setdefault(key, []).append(chat_id)
+
+        watches = _get_watchlist(u)
+        for watch in watches:
+            if watch.get("registered"):
+                continue
+            if not (watch.get("region") and watch.get("pou") and watch.get("course")):
+                continue
+            key = _make_key(watch["region"], watch["pou"], watch["course"])
+            watchlist.setdefault(key, []).append(chat_id)
 
     if not watchlist:
         return
@@ -856,14 +1088,12 @@ def scrape_and_alert(state: dict):
                     fut.cancel()
                     scrape_errors.setdefault(key, "TimeoutError: exceeded 120 s")
 
-    # Record a single heartbeat for the cycle
+    # Heartbeat
     if scrape_errors and not scrape_results:
-        # All scrapes failed
         first_err = next(iter(scrape_errors.values()))
         record_heartbeat_fail(first_err)
         _check_and_alert_heartbeat()
     elif scrape_errors:
-        # Partial failure — record the first error but keep going
         first_err = next(iter(scrape_errors.values()))
         record_heartbeat_fail(first_err)
         _check_and_alert_heartbeat()
@@ -873,22 +1103,26 @@ def scrape_and_alert(state: dict):
     # ── Phase 2: Process results and send alerts ───────────────────────────────
     for key, chat_ids in watchlist.items():
         if key not in scrape_results:
-            continue  # Scrape failed for this key — skip, already logged above
+            continue
 
         batches  = scrape_results[key]
         new_hash = compute_hash(batches)
+        # FIX: structural hash ignores seat counts — used for change notifications
+        new_struct_hash = compute_structural_hash(batches)
         region, pou, course = key.split("|", 2)
 
         old_entry        = batch_state.get(key, {})
         old_hash         = old_entry.get("hash", "")
+        old_struct_hash  = old_entry.get("struct_hash", "")
         old_batch_nos    = {b.get("Batch No", "") for b in old_entry.get("batches", [])}
         seat_alerts_sent = old_entry.get("seat_alerts_sent", {})
 
-        is_first = (old_hash == "")
-        changed  = (new_hash != old_hash)
+        # First run if we've never stored state for this key
+        is_first = not old_entry
+        # FIX: only flag as "changed" when the STRUCTURE changed, not seat counts
+        struct_changed = (new_struct_hash != old_struct_hash)
 
-        # FIX: Prune seat_alerts_sent for batches that no longer exist.
-        # This ensures re-used batch numbers correctly fire new alerts next season.
+        # Prune seat_alerts_sent for batches that no longer exist
         new_batch_nos = {b.get("Batch No", b.get("BatchNo", "")) for b in batches}
         for gone_batch_no in list(seat_alerts_sent.keys()):
             if gone_batch_no not in new_batch_nos:
@@ -900,7 +1134,7 @@ def scrape_and_alert(state: dict):
         for b in batches:
             batch_no = str(b.get("Batch No", b.get("BatchNo", "unknown")))
             already  = seat_alerts_sent.get(batch_no, [])
-            fires    = _new_threshold_fires(b, already)
+            fires    = _new_threshold_fires(b, already)  # FIX: guards 0-seat & uses [10,5,1]
             if fires:
                 seats  = _seats_int(b)
                 from_d = b.get("From Date", b.get("FromDate", ""))
@@ -915,6 +1149,7 @@ def scrape_and_alert(state: dict):
         # ── Persist updated batch state ───────────────────────────────────────
         batch_state[key] = {
             "hash":             new_hash,
+            "struct_hash":      new_struct_hash,   # FIX: store structural hash separately
             "batches":          batches,
             "last_checked":     datetime.now(timezone.utc).isoformat(),
             "region":           region,
@@ -923,8 +1158,8 @@ def scrape_and_alert(state: dict):
             "seat_alerts_sent": seat_alerts_sent,
         }
 
-        # ── Change-based notifications ────────────────────────────────────────
-        if changed or is_first:
+        # ── Change-based notifications (structural changes only) ──────────────
+        if struct_changed or is_first:
             added_batch_nos    = new_batch_nos - old_batch_nos
             newly_added        = [b for b in batches if b.get("Batch No", "") in added_batch_nos]
             batches_with_seats = [
@@ -954,11 +1189,11 @@ def scrape_and_alert(state: dict):
                     f"Register on ICAI portal →</a>\n\n"
                     f"Send /registered once you've enrolled."
                 )
-                logger.info(f"  Alerting {len(chat_ids)} user(s) — batch change detected ({key})")
+                logger.info(f"  Alerting {len(chat_ids)} user(s) — structural change detected ({key})")
                 for chat_id in chat_ids:
                     send(chat_id, change_msg)
         else:
-            logger.info(f"  No change ({len(batches)} batch(es)) — {key}")
+            logger.info(f"  No structural change ({len(batches)} batch(es)) — {key}")
 
         # ── Seat-threshold notifications ──────────────────────────────────────
         if threshold_msgs:
