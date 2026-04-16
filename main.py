@@ -22,6 +22,11 @@ Changes from original
   - _reset_stuck_processing() is called at startup to clear any
     processing=True flags left from a previous crash or Railway restart,
     preventing users from being permanently silenced.
+
+  - migrate_users_to_watchlist() is called at startup to convert any
+    existing single-watch user documents (old format with region/pou/course
+    at top level) to the new watchlist-array format required for multi-batch
+    tracking support.
 """
 
 import logging
@@ -37,6 +42,7 @@ from bot import (
     start_cleanup_scheduler,
     STATE_LOCK,
     _reset_stuck_processing,
+    migrate_users_to_watchlist,
 )
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -88,8 +94,6 @@ def background_monitor(state: dict):
 
         logger.info("═══ Batch monitor cycle starting ═══")
         try:
-            # scrape_and_alert() takes a deep copy of state["users"] under
-            # STATE_LOCK internally, so it never races with the polling thread.
             scrape_and_alert(state)
         except Exception as e:
             logger.error(f"Monitor cycle error: {e}", exc_info=True)
@@ -102,8 +106,7 @@ def background_monitor(state: dict):
 def telegram_polling_loop(state: dict):
     """
     Continuously polls Telegram for new messages / button taps.
-    Saves state to MongoDB only when updates were actually processed
-    (i.e. when the offset advanced), rather than on every 2-second tick.
+    Saves state to MongoDB only when updates were actually processed.
     """
     logger.info("Telegram polling loop started.")
 
@@ -112,7 +115,6 @@ def telegram_polling_loop(state: dict):
             offset_before = state.get("_offset", 0)
             process_updates(state)
 
-            # Only write to MongoDB if something actually changed
             if state.get("_offset", 0) != offset_before:
                 with STATE_LOCK:
                     save_state(state)
@@ -149,6 +151,12 @@ def main():
         f"Loaded {len(state.get('users', {}))} user(s), "
         f"offset={state.get('_offset', 0)}"
     )
+
+    # --- Migrate existing users from old single-watch to new watchlist format ---
+    if migrate_users_to_watchlist(state):
+        logger.info("User migration complete — saving updated state to MongoDB.")
+        with STATE_LOCK:
+            save_state(state)
 
     # --- Clear any processing flags left from a previous crash ---
     if _reset_stuck_processing(state):
