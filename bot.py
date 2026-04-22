@@ -1243,52 +1243,74 @@ def start_spom_setup(chat_id: str, state: dict, message_id=None):
         bg_msg_id = (resp.get("result") or {}).get("message_id")
 
     def _bg():
+        # Outer guard: ANY unhandled exception is logged clearly instead of
+        # dying silently and leaving the user stuck on "⏳ Fetching states...".
         try:
-            states = fetch_spom_states()
-        except Exception as e:
-            logger.error(f"fetch_spom_states failed: {e}")
-            states = []
-        finally:
-            _set_processing(chat_id, state, False)
+            _fetch_error = None
+            try:
+                states = fetch_spom_states()
+            except Exception as e:
+                logger.error(f"fetch_spom_states raised: {e}", exc_info=True)
+                _fetch_error = str(e)
+                states = []
+            finally:
+                _set_processing(chat_id, state, False)
+                _save_user(chat_id, state)
+
+            if not states:
+                retry_markup = ikb([[("🔄 Retry", "mode:spom")]])
+                err_text = (
+                    "❌ <b>Could not load states from SPOM portal.</b>\n\n"
+                    + (f"<i>Error: {html.escape(str(_fetch_error))}</i>\n\n"
+                       if _fetch_error else "")
+                    + "The ICAI portal may be slow or temporarily down.\n"
+                    "Tap <b>Retry</b> to try again, or come back in a minute."
+                )
+                if bg_msg_id:
+                    edit(chat_id, bg_msg_id, err_text, retry_markup)
+                else:
+                    send(chat_id, err_text, retry_markup)
+                return
+
+            state["users"].setdefault(chat_id, {})
+            # FIX: fetch_spom_states() returns list[dict] with keys "label" and "value".
+            # Previous code did `{label: val for label, val in states}` which iterated
+            # over dict *keys* ("value", "label") instead of the actual data, causing
+            # every state button to render as "value" and all city lookups to fail.
+            state_tuples = [(item["label"], item["value"]) for item in states]
+            state["users"][chat_id]["spom_pending"] = {
+                "step":      "state",
+                "state_map": {item["label"]: item["value"] for item in states},
+            }
             _save_user(chat_id, state)
 
-        if not states:
-            if bg_msg_id:
-                edit(chat_id, bg_msg_id,
-                     "❌ Could not reach the SPOM portal right now. Please try again in a minute.")
+            rows   = [state_tuples[i:i + 2] for i in range(0, len(state_tuples), 2)]
+            markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
+
+            existing_spom = state["users"][chat_id].get("spom_watches", [])
+            if existing_spom:
+                intro = (
+                    f"You already have <b>{len(existing_spom)}</b> SPOM watch(es). "
+                    f"Adding another one!\n\n"
+                    f"<b>Step 1 of 2 — Select your State:</b>"
+                )
             else:
-                send(chat_id, "Could not reach the SPOM portal right now. Please try again in a minute.")
-            return
+                intro = "🗓️ <b>SPOM Slot Monitor Setup</b>\n\n<b>Step 1 of 2 — Select your State:</b>"
 
-        state["users"].setdefault(chat_id, {})
-        # FIX: fetch_spom_states() returns list[dict] with keys "label" and "value".
-        # Previous code did `{label: val for label, val in states}` which iterated
-        # over dict *keys* ("value", "label") instead of the actual data, causing
-        # every state button to render as "value" and all city lookups to fail.
-        state_tuples = [(item["label"], item["value"]) for item in states]
-        state["users"][chat_id]["spom_pending"] = {
-            "step":      "state",
-            "state_map": {item["label"]: item["value"] for item in states},
-        }
-        _save_user(chat_id, state)
+            if bg_msg_id:
+                edit(chat_id, bg_msg_id, intro, markup)
+            else:
+                send(chat_id, intro, markup)
 
-        rows   = [state_tuples[i:i + 2] for i in range(0, len(state_tuples), 2)]
-        markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
-
-        existing_spom = state["users"][chat_id].get("spom_watches", [])
-        if existing_spom:
-            intro = (
-                f"You already have <b>{len(existing_spom)}</b> SPOM watch(es). "
-                f"Adding another one!\n\n"
-                f"<b>Step 1 of 2 — Select your State:</b>"
-            )
-        else:
-            intro = "🗓️ <b>SPOM Slot Monitor Setup</b>\n\n<b>Step 1 of 2 — Select your State:</b>"
-
-        if bg_msg_id:
-            edit(chat_id, bg_msg_id, intro, markup)
-        else:
-            send(chat_id, intro, markup)
+        except Exception as outer_e:
+            logger.error(f"[SPOM _bg] Unhandled crash in state-fetch thread: {outer_e}", exc_info=True)
+            try:
+                retry_markup = ikb([[("🔄 Retry", "mode:spom")]])
+                if bg_msg_id:
+                    edit(chat_id, bg_msg_id,
+                         "❌ An unexpected error occurred. Please tap Retry.", retry_markup)
+            except Exception:
+                pass
 
     threading.Thread(target=_bg, name=f"SpomStateFetch-{chat_id}", daemon=True).start()
 
