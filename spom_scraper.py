@@ -116,7 +116,12 @@ def _fetch_spom_centres(city_value: str, session=None) -> list[dict]:
         return []
 
 def fetch_spom_availability(state_value: str, city_value: str, centre_value: str, centre_label: str = "", session=None) -> dict:
-    """Fetch slot availability for one specific test centre."""
+    """Fetch slot availability for one specific test centre.
+
+    Returns available as list of {"date": str, "seats": int} dicts so that
+    alert messages can show the seat count alongside the date. Booked remains
+    a plain list of date strings (seat count is always 0, not useful to store).
+    """
     result = {"centre": centre_label or centre_value, "available": [], "booked": [], "error": None}
     try:
         s = session or _make_primed_session()
@@ -137,12 +142,13 @@ def fetch_spom_availability(state_value: str, city_value: str, centre_value: str
         for slot in date_blob.split(","):
             if "&&" in slot:
                 date_val, capacity = slot.split("&&", 1)
-                if int(capacity.strip()) > 0:
-                    result["available"].append(date_val.strip())
+                cap = int(capacity.strip())
+                if cap > 0:
+                    result["available"].append({"date": date_val.strip(), "seats": cap})
                 else:
                     result["booked"].append(date_val.strip())
-        
-        result["available"].sort()
+
+        result["available"].sort(key=lambda x: x["date"])
         result["booked"].sort()
     except Exception as exc:
         logger.error(f"fetch_spom_availability failed: {exc}")
@@ -160,14 +166,36 @@ def fetch_all_city_availability(state_value: str, city_value: str) -> list[dict]
     return results
 
 def compute_spom_hash(centre_results: list[dict]) -> str:
-    key_data = {item["centre"]: sorted(item.get("available", [])) for item in centre_results}
+    # available is now list[{"date": str, "seats": int}]; sort by date for stable hash
+    key_data = {
+        item["centre"]: sorted(
+            [{"date": s["date"], "seats": s["seats"]} for s in item.get("available", [])],
+            key=lambda x: x["date"]
+        )
+        for item in centre_results
+    }
     return hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
 
-def find_new_available_dates(old_results: list[dict], new_results: list[dict]) -> dict[str, list[str]]:
-    old_map = {item["centre"]: set(item.get("available", [])) for item in old_results}
+def find_new_available_dates(old_results: list[dict], new_results: list[dict]) -> dict[str, list[dict]]:
+    """
+    Returns a dict of centre → list of newly available {"date": str, "seats": int} dicts.
+    Old results may be plain date strings (from persisted state) or dicts — handled below.
+    """
+    def _date_set(items):
+        result = set()
+        for x in items:
+            result.add(x["date"] if isinstance(x, dict) else x)
+        return result
+
+    old_map = {item["centre"]: _date_set(item.get("available", [])) for item in old_results}
     new_dates = {}
     for item in new_results:
         centre = item["centre"]
-        added = sorted(set(item.get("available", [])) - old_map.get(centre, set()))
-        if added: new_dates[centre] = added
+        old_dates = old_map.get(centre, set())
+        added = sorted(
+            [s for s in item.get("available", []) if s["date"] not in old_dates],
+            key=lambda x: x["date"]
+        )
+        if added:
+            new_dates[centre] = added
     return new_dates
