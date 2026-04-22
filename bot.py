@@ -73,6 +73,7 @@ import html
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
@@ -82,13 +83,22 @@ import requests
 from bs4 import BeautifulSoup
 
 from scraper import scrape_batches, compute_hash, compute_structural_hash
+from spom_scraper import (
+    fetch_spom_states, fetch_spom_cities,
+    fetch_all_city_availability,
+    compute_spom_hash, find_new_available_dates,
+)
 from db import (
     load_state, save_state,
     load_batch_state, save_batch_state,
+    load_spom_state, save_spom_state,
     record_heartbeat_ok, record_heartbeat_fail, get_heartbeat,
     set_heartbeat_admin_alerted,
     delete_user, delete_stuck_users,
+    set_user_email, get_users_with_email,
+    clear_seat_alerts_for_key,          # FIX: targeted $unset instead of full-collection rewrite
 )
+from notifier import send_itt_oc_alert, send_spom_alert
 
 # --- Logging -----------------------------------------------------------------
 
@@ -110,6 +120,14 @@ if not _TOKEN:
 
 TOKEN    = _TOKEN
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
+
+# FIX: Never log the real token. Use this in exception handlers so Railway
+# logs never contain the bot secret even in tracebacks.
+_SAFE_API_BASE = "https://api.telegram.org/bot[REDACTED]"
+
+def _redact(text: str) -> str:
+    """Replace the bot token with [REDACTED] in any string before logging."""
+    return text.replace(TOKEN, "[REDACTED]") if TOKEN else text
 ICAI_URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx"
 ICAI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
@@ -132,6 +150,12 @@ COURSES = [
 
 # Shared lock — imported by main.py to synchronise state access
 STATE_LOCK = threading.Lock()
+
+# FIX: Prevents two overlapping scrape cycles from running concurrently.
+# Without this, if scraping takes >60 s the next tick starts, both read the
+# same old batch_state, and users receive duplicate alerts.
+_SCRAPE_LOCK      = threading.Lock()
+_SPOM_SCRAPE_LOCK = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -179,6 +203,7 @@ def _queue_worker():
         if wait > 0:
             time.sleep(wait)
 
+        send_ok = False
         try:
             r      = requests.post(f"{API_BASE}/{method}", json=payload, timeout=15)
             result = r.json()
@@ -187,22 +212,56 @@ def _queue_worker():
                     retry_after = result.get("parameters", {}).get("retry_after", 5)
                     logger.warning(f"Telegram 429 — retrying after {retry_after}s (chat {chat_id})")
                     time.sleep(retry_after)
-                    _enqueue(method, payload)
+                    # FIX: use blocking put with timeout instead of put_nowait.
+                    # put_nowait silently drops messages when the queue is full —
+                    # the worst time to drop a message is exactly when we're 429ing
+                    # because the queue is already under load.
+                    try:
+                        _MSG_QUEUE.put((method, payload), timeout=10)
+                    except queue.Full:
+                        logger.error(f"Queue full after 429 backoff — message DROPPED to {chat_id}")
                 else:
                     logger.error(f"Telegram {method} failed: {result}")
+                    send_ok = True   # count as "sent" to advance rate-limiter clock
+            else:
+                send_ok = True
         except requests.RequestException as e:
-            logger.error(f"Telegram API error ({method}): {e}")
+            # FIX: redact token before logging — API_BASE contains the raw token
+            logger.error(f"Telegram API error ({method}): {_redact(str(e))}")
 
-        with _queue_lock:
-            now2 = time.monotonic()
-            _last_sent_per_chat[chat_id] = now2
-            _last_sent_global = now2
+        # FIX: only update the rate-limiter timestamp when a message was actually
+        # delivered. Updating on failure causes the next queued message to wait
+        # a full PER_CHAT_DELAY for no reason, compounding delays under load.
+        if send_ok:
+            with _queue_lock:
+                now2 = time.monotonic()
+                _last_sent_per_chat[chat_id] = now2
+                _last_sent_global = now2
 
         _MSG_QUEUE.task_done()
 
 
-_worker_thread = threading.Thread(target=_queue_worker, name="MsgQueueWorker", daemon=True)
-_worker_thread.start()
+
+# FIX: Do NOT start the worker thread at module import time.
+# Starting threads at import makes bot.py impossible to test in isolation
+# (any `import bot` immediately spawns a real Telegram-calling thread).
+# Instead, main.py calls start_message_worker() explicitly during startup.
+_worker_thread: threading.Thread | None = None
+
+
+def start_message_worker() -> threading.Thread:
+    """
+    Start the rate-limited message queue worker thread.
+    Called once from main.py at startup — NOT at module import time.
+    Returns the thread so main.py can join it on shutdown.
+    """
+    global _worker_thread
+    _worker_thread = threading.Thread(
+        target=_queue_worker, name="MsgQueueWorker", daemon=True
+    )
+    _worker_thread.start()
+    return _worker_thread
+
 
 
 # --- Telegram helpers --------------------------------------------------------
@@ -213,7 +272,7 @@ def tg(method: str, **data):
         r = requests.post(f"{API_BASE}/{method}", json=data, timeout=15)
         return r.json()
     except requests.RequestException as e:
-        logger.error(f"Telegram API error ({method}): {e}")
+        logger.error(f"Telegram API error ({method}): {_redact(str(e))}")
         return {}
 
 
@@ -391,14 +450,19 @@ def cleanup_stuck_users(state: dict):
         total = delete_stuck_users()
         logger.info(f"[Daily Cleanup] Removed {total} stale user document(s) from MongoDB.")
 
-        purged_keys = [
-            uid for uid, u in list(state.get("users", {}).items())
-            if "pending" in u and "course" not in u and "watchlist" not in u
-        ]
-        for uid in purged_keys:
-            state["users"].pop(uid, None)
-            with _queue_lock:
-                _last_sent_per_chat.pop(uid, None)
+        # FIX: Acquire STATE_LOCK before touching state["users"].
+        # cleanup_stuck_users runs in the DailyCleanup thread while the batch
+        # monitor and polling loop are also reading/writing state concurrently.
+        # Mutating a shared dict without the lock is a data race.
+        with STATE_LOCK:
+            purged_keys = [
+                uid for uid, u in list(state.get("users", {}).items())
+                if "pending" in u and "course" not in u and "watchlist" not in u
+            ]
+            for uid in purged_keys:
+                state["users"].pop(uid, None)
+                with _queue_lock:
+                    _last_sent_per_chat.pop(uid, None)
 
         if ADMIN_CHAT_ID:
             send(
@@ -412,6 +476,8 @@ def cleanup_stuck_users(state: dict):
 
 
 def start_cleanup_scheduler(state: dict):
+    from datetime import timedelta   # FIX: import at function scope, not inside while loop
+
     def _scheduler():
         logger.info("Daily cleanup scheduler started — will run at 1:00 AM IST every day.")
         while True:
@@ -421,7 +487,6 @@ def start_cleanup_scheduler(state: dict):
                 hour=target_hour, minute=target_minute, second=0, microsecond=0
             )
             if now_utc >= next_run:
-                from datetime import timedelta
                 next_run += timedelta(days=1)
             wait_seconds = (next_run - now_utc).total_seconds()
             logger.info(f"[Daily Cleanup] Next run in {wait_seconds / 3600:.1f} hours (1:00 AM IST).")
@@ -435,9 +500,18 @@ def start_cleanup_scheduler(state: dict):
 # --- ICAI helpers -------------------------------------------------------------
 
 def fetch_regions():
-    """Return list of (label, value) for the Region dropdown."""
+    """
+    Return list of (label, value) for the Region dropdown.
+
+    FIX: use a Session so the ASP.NET session cookie set on the GET is
+    automatically carried on any subsequent POST requests.  The original
+    bare requests.get() discarded the cookie immediately after the call.
+    """
     try:
-        r    = requests.get(ICAI_URL, headers=ICAI_HEADERS, timeout=20)
+        session = requests.Session()
+        session.headers.update(ICAI_HEADERS)
+        r = session.get(ICAI_URL, timeout=20)
+        r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         sel  = soup.find("select", {"id": "ddl_reg"})
         if not sel:
@@ -453,9 +527,21 @@ def fetch_regions():
 
 
 def fetch_pous(region_value: str):
-    """POST region selection and return PoU options as (label, value)."""
+    """
+    POST region selection and return PoU options as (label, value).
+
+    FIX: use a shared Session for both the initial GET and the postback POST.
+    Without a Session the ASP.NET session cookie is discarded between the two
+    calls — the server rejects the stateless POST and returns a blank PoU
+    dropdown, which is the root cause of intermittent /watch setup failures
+    ("Could not fetch city list" error seen in production).
+    """
     try:
-        r0    = requests.get(ICAI_URL, headers=ICAI_HEADERS, timeout=20)
+        session = requests.Session()
+        session.headers.update(ICAI_HEADERS)
+
+        r0 = session.get(ICAI_URL, timeout=20)
+        r0.raise_for_status()
         soup0 = BeautifulSoup(r0.text, "lxml")
 
         def vs(name):
@@ -470,12 +556,12 @@ def fetch_pous(region_value: str):
             "__EVENTARGUMENT":      "",
             "ddl_reg":              region_value,
         }
-        headers = {
-            **ICAI_HEADERS,
+        post_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": ICAI_URL,
         }
-        r1    = requests.post(ICAI_URL, data=payload, headers=headers, timeout=20)
+        r1 = session.post(ICAI_URL, data=payload, headers=post_headers, timeout=20)
+        r1.raise_for_status()
         soup1 = BeautifulSoup(r1.text, "lxml")
         sel   = soup1.find("select", {"id": "ddlPou"})
         if not sel:
@@ -545,7 +631,9 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
         answer_cb(message_id, "⏳ Still loading, please wait...")
         return
 
-    pending      = state["users"][chat_id].get("pending", {})
+    # FIX: use .get() instead of direct key access — chat_id may not exist if
+    # the user taps a stale inline button after their account was deleted.
+    pending      = state["users"].get(chat_id, {}).get("pending", {})
     region_map   = pending.get("region_map", {})
     region_value = region_map.get(region_label)
 
@@ -580,7 +668,8 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
 
 
 def ask_course(chat_id: str, pou_label: str, state: dict, message_id: int):
-    pending   = state["users"][chat_id].get("pending", {})
+    # FIX: use .get() — same stale-button KeyError risk as ask_pou
+    pending   = state["users"].get(chat_id, {}).get("pending", {})
     pou_map   = pending.get("pou_map", {})
     pou_value = pou_map.get(pou_label)
 
@@ -706,6 +795,41 @@ def confirm_subscription(chat_id: str, course: str, state: dict, message_id: int
     ).start()
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODE SELECTION — /start entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ask_mode(chat_id: str, state: dict):
+    """
+    /start handler: reset any in-progress flow and show a mode-selection
+    keyboard so users can choose between ITT/OC batch tracking and SPOM
+    exam-slot tracking.
+    """
+    u = state["users"].setdefault(chat_id, {})
+
+    # Reset any in-progress flows safely
+    u.pop("pending",      None)
+    u.pop("spom_pending", None)
+    u["processing"] = False
+    u["mode_pending"] = True
+    save_state(state)
+
+    markup = ikb([
+        [("📚 ITT / OC Batches",   "mode:itt")],
+        [("🧾 SPOM Exam Slots",    "mode:spom")],
+    ])
+    send(
+        chat_id,
+        "👋 <b>Welcome to ICAI Monitor Bot!</b>\n\n"
+        "What would you like to track today?\n\n"
+        "📚 <b>ITT / OC Batches</b> — get alerts when ICAI batch seats open\n"
+        "🧾 <b>SPOM Exam Slots</b>  — get alerts when new exam dates appear\n\n"
+        "<i>You can run both trackers simultaneously.</i>",
+        markup,
+    )
+
+
 # --- Command handlers ---------------------------------------------------------
 
 def handle_message(msg: dict, state: dict):
@@ -715,7 +839,10 @@ def handle_message(msg: dict, state: dict):
     if _is_processing(chat_id, state):
         return
 
-    if text.startswith("/start") or text.startswith("/watch"):
+    if text.startswith("/start"):
+        ask_mode(chat_id, state)
+
+    elif text.startswith("/watch"):
         start_setup(chat_id, state)
 
     elif text.startswith("/status"):
@@ -765,20 +892,24 @@ def handle_message(msg: dict, state: dict):
         _handle_registered(chat_id, state)
 
     elif text.startswith("/help"):
-        send(
-            chat_id,
-            "<b>ICAI Batch Monitor Bot</b>\n\n"
-            "/watch       — add a new batch to monitor\n"
-            "/status      — see all your current watches\n"
-            "/stop        — stop one or all watches\n"
-            "/registered  — I've enrolled! Stop notifying me\n"
-            "/help        — this message\n\n"
-            "<i>You can track multiple Region/City/Course combinations at once.\n"
-            "Seat alerts fire at 10, 5, and 1 remaining seats.</i>",
-        )
+        _send_help(chat_id)
+
+    # ── Email management ──────────────────────────────────────────────────────
+    elif text.lower().startswith("/emailoff"):
+        _handle_emailoff(chat_id, state)
+
+    elif text.lower().startswith("/email"):
+        _handle_email_command(chat_id, text, state)
+
+    # ── SPOM slot monitoring ──────────────────────────────────────────────────
+    elif text.lower().startswith("/spomstop"):
+        _handle_spomstop(chat_id, state)
+
+    elif text.lower().startswith("/spom"):
+        start_spom_setup(chat_id, state)
 
     else:
-        send(chat_id, "Use /watch to set up a batch alert, or /help for all commands.")
+        send(chat_id, "Use /watch to set up a batch alert, /spom for exam slots, or /help for all commands.")
 
 
 def _handle_registered(chat_id: str, state: dict):
@@ -829,6 +960,7 @@ def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
     region = watch.get("region", "")
     pou    = watch.get("pou",    "")
     course = watch.get("course", "")
+    key    = _make_key(region, pou, course)   # build key before watches list is mutated further
 
     if watches:
         u["watchlist"] = watches
@@ -840,13 +972,11 @@ def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
     else:
         _delete_user(chat_id, state)
 
-    # Clean up seat alert state for the removed key
-    key = _make_key(region, pou, course)
+    # FIX: use targeted $unset instead of loading the entire batch collection,
+    # modifying it in memory, then rewriting every document back to MongoDB.
+    # clear_seat_alerts_for_key issues a single update_one against one document.
     try:
-        batch_state_data = load_batch_state()
-        if key in batch_state_data:
-            batch_state_data[key].pop("seat_alerts_sent", None)
-            save_batch_state(batch_state_data)
+        clear_seat_alerts_for_key(key)
     except Exception as e:
         logger.warning(f"Could not clean seat alert state for {key}: {e}")
 
@@ -866,6 +996,309 @@ def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _send_help(chat_id: str):
+    send(
+        chat_id,
+        "<b>📖 ICAI Monitor Bot — Help &amp; Commands</b>\n\n"
+
+        "Use /start anytime to choose what you want to track.\n\n"
+
+        "<b>──────────────────────────────────────────</b>\n"
+        "📚 <b>ITT / OC Batch Tracker</b>\n"
+        "  /watch       — add a new ITT/OC batch to monitor\n"
+        "  /status      — see all your active batch watches\n"
+        "  /stop        — remove one or all batch watches\n"
+        "  /registered  — mark a batch as enrolled (stops alerts)\n\n"
+
+        "<b>──────────────────────────────────────────</b>\n"
+        "🧾 <b>SPOM Exam Slot Tracker</b>\n"
+        "  /spom        — watch SPOM slots for a State + City\n"
+        "  /spomstop    — stop one or all SPOM watches\n\n"
+
+        "<b>──────────────────────────────────────────</b>\n"
+        "📧 <b>Email Notifications</b>\n"
+        "  /email &lt;addr&gt;  — save your email for alerts\n"
+        "                 e.g. <code>/email you@gmail.com</code>\n"
+        "  /emailoff      — disable email notifications\n\n"
+
+        "<b>──────────────────────────────────────────</b>\n"
+        "⚙️ <b>Other Commands</b>\n"
+        "  /status      — view active ITT/OC trackers\n"
+        "  /stop        — remove ITT/OC tracker\n"
+        "  /spomstop    — remove SPOM tracker\n"
+        "  /help        — show this guide\n\n"
+
+        "<i>✅ You can run both ITT/OC and SPOM trackers at the same time.\n"
+        "Batch seat alerts fire at 10, 5, and 1 remaining seat.\n"
+        "SPOM alerts fire ONLY when new available (green) dates appear.</i>",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EMAIL MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# FIX: original regex rejected valid subdomain addresses like user@mail.co.uk
+# or user@students.university.edu because the domain segment didn't allow dots.
+# New pattern requires at least one dot in the domain and a 2+ char TLD.
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)*\.[a-zA-Z]{2,}$"
+)
+
+
+def _handle_email_command(chat_id: str, text: str, state: dict):
+    """
+    /email <address>  — save email and enable notifications.
+    Called when text starts with /email but NOT /emailoff.
+    """
+    parts = text.strip().split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        u     = state["users"].get(chat_id, {})
+        cur   = u.get("email", "")
+        ena   = u.get("email_enabled", False)
+        extra = (
+            f"\n\nCurrent: <code>{html.escape(cur)}</code> "
+            f"({'enabled ✅' if ena else 'disabled 🔕'})"
+            if cur else ""
+        )
+        send(
+            chat_id,
+            "📧 <b>Email Notifications</b>\n\n"
+            "Send your email address to receive alerts:\n"
+            "<code>/email youraddress@example.com</code>\n\n"
+            "You'll receive emails for:\n"
+            "  • ITT/OC batch updates\n"
+            "  • SPOM new slot availability\n\n"
+            "Use /emailoff to disable email alerts."
+            + extra,
+        )
+        return
+
+    email = parts[1].strip().lower()
+    if not _EMAIL_RE.match(email):
+        send(chat_id, "❌ That doesn't look like a valid email address. Please check and try again.")
+        return
+
+    u = state["users"].setdefault(chat_id, {})
+    u["email"]         = email
+    u["email_enabled"] = True
+    save_state(state)
+    set_user_email(chat_id, email, enabled=True)
+
+    send(
+        chat_id,
+        f"✅ <b>Email saved!</b>\n\n"
+        f"Alerts will be sent to: <code>{html.escape(email)}</code>\n\n"
+        f"You'll receive emails for:\n"
+        f"  • ITT/OC batch updates\n"
+        f"  • SPOM new slot availability\n\n"
+        f"Use <b>/emailoff</b> to disable email notifications anytime.",
+    )
+
+
+def _handle_emailoff(chat_id: str, state: dict):
+    """
+    /emailoff  — disable email notifications (keeps address stored).
+    """
+    u = state["users"].get(chat_id, {})
+    if not u.get("email"):
+        send(chat_id, "You haven't set an email address yet. Use /email &lt;address&gt; to save one.")
+        return
+
+    u["email_enabled"] = False
+    save_state(state)
+    set_user_email(chat_id, u["email"], enabled=False)
+
+    send(
+        chat_id,
+        f"🔕 Email notifications disabled.\n\n"
+        f"Your address <code>{html.escape(u['email'])}</code> is still saved.\n"
+        f"Re-enable with: <code>/email {html.escape(u['email'])}</code>",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPOM SETUP FLOW  (State → City → confirm)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def start_spom_setup(chat_id: str, state: dict, message_id=None):
+    """Begin SPOM watch setup: fetch states and show keyboard."""
+    if _is_processing(chat_id, state):
+        return
+
+    _set_processing(chat_id, state, True)
+    save_state(state)
+    try:
+        states = fetch_spom_states()
+    finally:
+        _set_processing(chat_id, state, False)
+        save_state(state)
+
+    if not states:
+        send(chat_id, "Could not reach the SPOM portal right now. Please try again in a minute.")
+        return
+
+    state["users"].setdefault(chat_id, {})
+    state["users"][chat_id]["spom_pending"] = {
+        "step":      "state",
+        "state_map": {label: val for label, val in states},
+    }
+    save_state(state)
+
+    rows   = [states[i:i + 2] for i in range(0, len(states), 2)]
+    markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
+
+    existing_spom = state["users"][chat_id].get("spom_watches", [])
+    if existing_spom:
+        intro = (
+            f"You already have <b>{len(existing_spom)}</b> SPOM watch(es). "
+            f"Adding another one!\n\n"
+            f"<b>Step 1 of 2 — Select your State:</b>"
+        )
+    else:
+        intro = "🗓️ <b>SPOM Slot Monitor Setup</b>\n\n<b>Step 1 of 2 — Select your State:</b>"
+
+    if message_id:
+        edit(chat_id, message_id, intro, markup)
+    else:
+        send(chat_id, intro, markup)
+
+
+def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int):
+    """Second SPOM setup step: fetch cities and show keyboard."""
+    if _is_processing(chat_id, state):
+        answer_cb(message_id, "⏳ Still loading, please wait...")
+        return
+
+    spom_pending = state["users"][chat_id].get("spom_pending", {})
+    state_map    = spom_pending.get("state_map", {})
+    state_value  = state_map.get(state_label)
+
+    if not state_value:
+        send(chat_id, "State not recognised. Type /spom to restart.")
+        return
+
+    _set_processing(chat_id, state, True)
+    save_state(state)
+    try:
+        cities = fetch_spom_cities(state_value)
+    finally:
+        _set_processing(chat_id, state, False)
+        save_state(state)
+
+    if not cities:
+        send(chat_id, "Could not fetch city list for that state. Type /spom to try again.")
+        return
+
+    state["users"][chat_id]["spom_pending"] = {
+        "step":        "city",
+        "state_label": state_label,
+        "state_value": state_value,
+        "city_map":    {label: val for label, val in cities},
+    }
+    save_state(state)
+
+    rows   = [cities[i:i + 2] for i in range(0, len(cities), 2)]
+    markup = ikb([[(label, f"spom_city:{label}") for label, _ in row] for row in rows])
+    edit(chat_id, message_id,
+         f"<b>Step 2 of 2 — Select your City</b>\n(State: {html.escape(state_label)})",
+         markup)
+
+
+def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
+    """Final SPOM setup step: save the watch and clean up pending."""
+    spom_pending = state["users"][chat_id].get("spom_pending", {})
+    city_map     = spom_pending.get("city_map", {})
+    city_value   = city_map.get(city_label)
+    state_label  = spom_pending.get("state_label", "")
+    state_value  = spom_pending.get("state_value", "")
+
+    if not city_value:
+        send(chat_id, "City not recognised. Type /spom to restart.")
+        return
+
+    u            = state["users"].setdefault(chat_id, {})
+    spom_watches = u.setdefault("spom_watches", [])
+
+    already = any(
+        w.get("state_value") == state_value and w.get("city_value") == city_value
+        for w in spom_watches
+    )
+
+    u.pop("spom_pending", None)
+
+    if already:
+        edit(
+            chat_id, message_id,
+            f"<b>Already watching!</b>\n\n"
+            f"You're already monitoring SPOM slots for "
+            f"<b>{html.escape(city_label)}, {html.escape(state_label)}</b>.\n\n"
+            f"Use /spomstop to remove it.",
+        )
+        save_state(state)
+        return
+
+    spom_watches.append({
+        "state_label": state_label,
+        "state_value": state_value,
+        "city_label":  city_label,
+        "city_value":  city_value,
+    })
+    u["active"] = True
+    save_state(state)
+
+    email_note = ""
+    if u.get("email_enabled") and u.get("email"):
+        email_note = f" + email to <code>{html.escape(u['email'])}</code>"
+
+    edit(
+        chat_id, message_id,
+        f"✅ <b>SPOM watch added!</b>\n\n"
+        f"State : {html.escape(state_label)}\n"
+        f"City  : {html.escape(city_label)}\n\n"
+        f"I'll alert you via Telegram{email_note} the moment "
+        f"new exam slots open in your city.\n\n"
+        f"<i>ℹ️ Only newly available (green) dates trigger alerts.</i>\n"
+        f"Use /spomstop to remove this watch.",
+    )
+
+
+def _handle_spomstop(chat_id: str, state: dict):
+    """
+    /spomstop  — remove one or all SPOM watches interactively.
+    """
+    u            = state["users"].get(chat_id, {})
+    spom_watches = u.get("spom_watches", [])
+
+    if not spom_watches:
+        send(chat_id, "You don't have any SPOM watches. Use /spom to set one up.")
+        return
+
+    if len(spom_watches) == 1:
+        w = spom_watches[0]
+        u["spom_watches"] = []
+        save_state(state)
+        send(
+            chat_id,
+            f"✅ Stopped watching SPOM slots for "
+            f"<b>{html.escape(w['city_label'])}, {html.escape(w['state_label'])}</b>.\n\n"
+            f"Use /spom to add a new watch.",
+        )
+        return
+
+    rows = [
+        [( f"{html.escape(w['city_label'])} ({html.escape(w['state_label'])})",
+           f"spom_stop:{i}" )]
+        for i, w in enumerate(spom_watches)
+    ]
+    rows.append([("🛑 Stop All SPOM Watches", "spom_stop:all")])
+    send(chat_id, "<b>Which SPOM watch would you like to stop?</b>", ikb(rows))
+
+
 def handle_callback(cb: dict, state: dict):
     chat_id    = str(cb["message"]["chat"]["id"])
     message_id = cb["message"]["message_id"]
@@ -881,8 +1314,23 @@ def handle_callback(cb: dict, state: dict):
 
     pending_step = state["users"].get(chat_id, {}).get("pending", {}).get("step", "")
 
+    # ── Mode selection (from /start) ──────────────────────────────────────────
+    if data == "mode:itt":
+        u = state["users"].setdefault(chat_id, {})
+        u.pop("mode_pending", None)
+        u["mode"] = "itt"
+        save_state(state)
+        start_setup(chat_id, state, message_id=message_id)
+
+    elif data == "mode:spom":
+        u = state["users"].setdefault(chat_id, {})
+        u.pop("mode_pending", None)
+        u["mode"] = "spom"
+        save_state(state)
+        start_spom_setup(chat_id, state, message_id=message_id)
+
     # ── Setup flow callbacks ──────────────────────────────────────────────────
-    if data.startswith("region:") and pending_step == "region":
+    elif data.startswith("region:") and pending_step == "region":
         ask_pou(chat_id, data[len("region:"):], state, message_id)
 
     elif data.startswith("pou:") and pending_step == "pou":
@@ -939,6 +1387,51 @@ def handle_callback(cb: dict, state: dict):
         except ValueError:
             send(chat_id, "Something went wrong. Please try /registered again.")
 
+    # ── SPOM setup flow callbacks ─────────────────────────────────────────────
+    elif data.startswith("spom_state:"):
+        spom_step = state["users"].get(chat_id, {}).get("spom_pending", {}).get("step", "")
+        if spom_step == "state":
+            _spom_ask_city(chat_id, data[len("spom_state:"):], state, message_id)
+        else:
+            send(chat_id, "Unexpected state. Use /spom to restart.")
+
+    elif data.startswith("spom_city:"):
+        spom_step = state["users"].get(chat_id, {}).get("spom_pending", {}).get("step", "")
+        if spom_step == "city":
+            _spom_confirm(chat_id, data[len("spom_city:"):], state, message_id)
+        else:
+            send(chat_id, "Unexpected state. Use /spom to restart.")
+
+    # ── SPOM stop callbacks ───────────────────────────────────────────────────
+    elif data.startswith("spom_stop:"):
+        idx_str      = data[len("spom_stop:"):]
+        u            = state["users"].get(chat_id, {})
+        spom_watches = u.get("spom_watches", [])
+
+        if idx_str == "all":
+            u["spom_watches"] = []
+            save_state(state)
+            send(chat_id, "All SPOM watches stopped. Use /spom anytime to add new ones.")
+        else:
+            try:
+                idx = int(idx_str)
+                if 0 <= idx < len(spom_watches):
+                    removed = spom_watches.pop(idx)
+                    u["spom_watches"] = spom_watches
+                    save_state(state)
+                    send(
+                        chat_id,
+                        f"✅ Stopped watching SPOM slots for "
+                        f"<b>{html.escape(removed['city_label'])}, "
+                        f"{html.escape(removed['state_label'])}</b>.\n\n"
+                        f"{'Use /spom to add another watch.' if not spom_watches else f'You have {len(spom_watches)} SPOM watch(es) remaining.'}",
+                    )
+                else:
+                    send(chat_id, "Watch not found. Please try /spomstop again.")
+            except (ValueError, KeyError) as e:
+                logger.error(f"spom_stop callback error: {e}")
+                send(chat_id, "Something went wrong. Please try /spomstop again.")
+
 
 # --- Poll Telegram updates ----------------------------------------------------
 
@@ -951,9 +1444,17 @@ def process_updates(state: dict):
             params={"offset": offset, "timeout": 5},
             timeout=20,
         )
+        # FIX: check HTTP status before parsing. A 401 (bad token), 409
+        # (webhook conflict), or 5xx returns a body without "result", so
+        # resp.json().get("result", []) silently returns [] and no error is logged.
+        if not resp.ok:
+            logger.error(
+                f"getUpdates failed: HTTP {resp.status_code} — {resp.text[:200]}"
+            )
+            return
         updates = resp.json().get("result", [])
     except requests.RequestException as e:
-        logger.error(f"getUpdates failed: {e}")
+        logger.error(f"getUpdates failed: {_redact(str(e))}")
         return
 
     for upd in updates:
@@ -1034,7 +1535,22 @@ def scrape_and_alert(state: dict):
       4. Independently check seat thresholds (10/5/1) and alert per batch
          — never fires for 0-seat batches (FIX for zero-seat alert issue)
       5. Persist updated batch state to MongoDB
+
+    FIX: guarded by _SCRAPE_LOCK so that if a scrape cycle takes longer than
+    MONITOR_INTERVAL_SEC (60 s), the next tick is skipped rather than running
+    a second concurrent cycle that reads stale state and double-alerts users.
     """
+    if not _SCRAPE_LOCK.acquire(blocking=False):
+        logger.warning("Previous batch scrape cycle still running — skipping this tick.")
+        return
+    try:
+        _scrape_and_alert_impl(state)
+    finally:
+        _SCRAPE_LOCK.release()
+
+
+def _scrape_and_alert_impl(state: dict):
+    """Inner implementation — called only from scrape_and_alert under _SCRAPE_LOCK."""
     with STATE_LOCK:
         users_snapshot = copy.deepcopy(state.get("users", {}))
 
@@ -1088,15 +1604,26 @@ def scrape_and_alert(state: dict):
                     fut.cancel()
                     scrape_errors.setdefault(key, "TimeoutError: exceeded 120 s")
 
-    # Heartbeat
-    if scrape_errors and not scrape_results:
+    # FIX: differentiate between a TOTAL failure (no results at all — real outage)
+    # and a PARTIAL failure (some keys failed — intermittent network issue).
+    # The original code called record_heartbeat_fail for both cases, causing
+    # admin panic alerts after any single flaky scrape. Now:
+    #   - All failed  → heartbeat_fail  → admin alert after threshold
+    #   - Some failed → heartbeat_ok    → log a warning, don't alert admin
+    #   - None failed → heartbeat_ok
+    if scrape_errors:
         first_err = next(iter(scrape_errors.values()))
-        record_heartbeat_fail(first_err)
-        _check_and_alert_heartbeat()
-    elif scrape_errors:
-        first_err = next(iter(scrape_errors.values()))
-        record_heartbeat_fail(first_err)
-        _check_and_alert_heartbeat()
+        if scrape_results:
+            # Partial failure — at least some keys scraped successfully
+            logger.warning(
+                f"Partial scrape failure: {len(scrape_errors)} key(s) failed, "
+                f"{len(scrape_results)} succeeded — {first_err}"
+            )
+            record_heartbeat_ok()   # don't alarm admin for transient per-key failures
+        else:
+            # Total failure — nothing scraped at all
+            record_heartbeat_fail(first_err)
+            _check_and_alert_heartbeat()
     else:
         record_heartbeat_ok()
 
@@ -1192,6 +1719,21 @@ def scrape_and_alert(state: dict):
                 logger.info(f"  Alerting {len(chat_ids)} user(s) — structural change detected ({key})")
                 for chat_id in chat_ids:
                     send(chat_id, change_msg)
+                    # ── Email notification ────────────────────────────────────
+                    u_snap = users_snapshot.get(chat_id, {})
+                    if u_snap.get("email_enabled") and u_snap.get("email"):
+                        try:
+                            send_itt_oc_alert(
+                                batches_with_seats or newly_added or batches,
+                                region   = region,
+                                pou      = pou,
+                                course   = course,
+                                to_email = u_snap["email"],
+                            )
+                        except Exception as email_err:
+                            logger.error(
+                                f"  Email send failed for {chat_id}: {email_err}"
+                            )
         else:
             logger.info(f"  No structural change ({len(batches)} batch(es)) — {key}")
 
@@ -1210,4 +1752,177 @@ def scrape_and_alert(state: dict):
             for chat_id in chat_ids:
                 send(chat_id, threshold_alert)
 
+            # FIX: persist seat_alerts_sent immediately after sending alerts for
+            # this key — do NOT wait until the end of the full cycle.
+            # If Railway restarts between the alert send and the end-of-cycle
+            # save_batch_state call, seat_alerts_sent is lost, and the same
+            # threshold fires again on the next startup.
+            try:
+                save_batch_state({key: batch_state[key]})
+            except Exception as e:
+                logger.error(f"  Failed to persist seat_alerts_sent for {key}: {e}")
+
     save_batch_state(batch_state)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPOM MONITOR — scrape slots and alert on NEW available dates only
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def spom_scrape_and_alert(state: dict):
+    """
+    For every unique (state_value, city_value) pair across all active SPOM
+    subscribers:
+      1. Fetch current slot availability from spmt.icai.org
+      2. Compare with persisted availability
+      3. Notify via Telegram + email ONLY when new available (green) dates appear
+      4. Persist updated SPOM state to MongoDB
+
+    Users are notified ONLY for the state+city they subscribed to.
+    Fully-booked (red) dates and unchanged dates never trigger alerts.
+
+    FIX: guarded by _SPOM_SCRAPE_LOCK — SPOM scraping is sequential and can
+    take several minutes for cities with many test centres. Without the lock
+    a new 5-minute tick could start before the previous one completes.
+    """
+    if not _SPOM_SCRAPE_LOCK.acquire(blocking=False):
+        logger.warning("Previous SPOM scrape cycle still running — skipping this tick.")
+        return
+    try:
+        _spom_scrape_and_alert_impl(state)
+    finally:
+        _SPOM_SCRAPE_LOCK.release()
+
+
+def _spom_scrape_and_alert_impl(state: dict):
+    """Inner implementation — called only from spom_scrape_and_alert under _SPOM_SCRAPE_LOCK."""
+    with STATE_LOCK:
+        users_snapshot = copy.deepcopy(state.get("users", {}))
+
+    spom_state = load_spom_state()
+
+    # Build a map: (state_value, city_value) → list of (chat_id, state_label, city_label)
+    city_watchers: dict = {}
+    for chat_id, u in users_snapshot.items():
+        if not u.get("active"):
+            continue
+        for w in u.get("spom_watches", []):
+            sv = w.get("state_value", "")
+            cv = w.get("city_value",  "")
+            if not (sv and cv):
+                continue
+            key = f"{sv}|{cv}"
+            city_watchers.setdefault(key, []).append({
+                "chat_id":     chat_id,
+                "state_label": w.get("state_label", sv),
+                "city_label":  w.get("city_label",  cv),
+                "email":       u.get("email"),
+                "email_enabled": u.get("email_enabled", False),
+            })
+
+    if not city_watchers:
+        return
+
+    logger.info(f"[SPOM] Checking {len(city_watchers)} city/state pair(s)...")
+
+    for city_key, watchers in city_watchers.items():
+        state_value = city_key.split("|", 1)[0]
+        city_value  = city_key.split("|", 1)[1]
+        state_label = watchers[0]["state_label"]
+        city_label  = watchers[0]["city_label"]
+
+        try:
+            centre_results = fetch_all_city_availability(state_value, city_value)
+        except Exception as e:
+            logger.error(f"[SPOM] fetch_all_city_availability failed ({city_key}): {e}")
+            continue
+
+        if not centre_results:
+            logger.info(f"[SPOM] No centres found for {city_label}, {state_label}")
+            continue
+
+        new_hash = compute_spom_hash(centre_results)
+
+        # Rebuild old results list from persisted state for this city
+        old_results: list[dict] = []
+        for item in centre_results:
+            centre_key  = f"{state_value}|{city_value}|{item['centre']}"
+            old_entry   = spom_state.get(centre_key, {})
+            old_results.append({
+                "centre":    item["centre"],
+                "available": old_entry.get("available_dates", []),
+                "booked":    old_entry.get("booked_dates",    []),
+            })
+
+        # Find dates that are NEWLY available (not in old state)
+        new_dates_by_centre = find_new_available_dates(old_results, centre_results)
+
+        # Persist updated state for every centre in this city
+        for item in centre_results:
+            centre_key = f"{state_value}|{city_value}|{item['centre']}"
+            spom_state[centre_key] = {
+                "available_dates": item.get("available", []),
+                "booked_dates":    item.get("booked",    []),
+                "hash":            new_hash,
+                "state_label":     state_label,
+                "city_label":      city_label,
+                "centre_label":    item["centre"],
+            }
+
+        if not new_dates_by_centre:
+            avail_count = sum(len(i.get("available", [])) for i in centre_results)
+            logger.info(
+                f"[SPOM] No new slots for {city_label}, {state_label} "
+                f"({avail_count} existing available date(s), no change)"
+            )
+            continue
+
+        # ── Send Telegram + email alerts ──────────────────────────────────────
+        total_new   = sum(len(v) for v in new_dates_by_centre.values())
+        logger.info(
+            f"[SPOM] {total_new} new slot(s) detected in {city_label}, {state_label} "
+            f"— alerting {len(watchers)} subscriber(s)"
+        )
+
+        # Build Telegram message
+        tg_lines = [f"📅 <b>New SPOM Slots Available!</b>\n",
+                    f"State : {_esc(state_label)}",
+                    f"City  : {_esc(city_label)}\n"]
+
+        for centre, dates in new_dates_by_centre.items():
+            tg_lines.append(f"<b>🏛️ {_esc(centre)}</b>")
+            for d in dates:
+                tg_lines.append(f"  ✅ {_esc(d)}")
+            tg_lines.append("")
+
+        tg_lines.append(
+            "<a href='https://spmt.icai.org/ICAI/LoginAction_showSlotDetails.action'>"
+            "Book your slot now →</a>"
+        )
+        tg_msg = "\n".join(tg_lines)
+
+        notified_emails: set = set()   # de-dup: one email per address per cycle
+
+        for watcher in watchers:
+            chat_id = watcher["chat_id"]
+            send(chat_id, tg_msg)
+
+            if watcher.get("email_enabled") and watcher.get("email"):
+                email = watcher["email"]
+                if email not in notified_emails:
+                    try:
+                        send_spom_alert(
+                            new_dates_by_centre,
+                            state_label = state_label,
+                            city_label  = city_label,
+                            to_email    = email,
+                        )
+                        notified_emails.add(email)
+                    except Exception as email_err:
+                        logger.error(
+                            f"[SPOM] Email send failed for {chat_id} "
+                            f"({email}): {email_err}"
+                        )
+
+    save_spom_state(spom_state)
+    logger.info("[SPOM] Cycle complete.")
