@@ -20,7 +20,7 @@ on:
           - test-email
 
 permissions:
-  contents: read   # read-only — no more committing state files to the repo
+  contents: read   # read-only — no committing state files to the repo
 
 jobs:
   check:
@@ -34,6 +34,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # FIX: cache pip packages so we don't re-download 60+ MB of deps
+          # on every 10-minute run (144 times/day). Saves ~30-60 s per run
+          # and avoids PyPI rate-limiting under heavy GitHub Actions load.
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -45,6 +50,11 @@ jobs:
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
+          # FIX: preferences are now env-var driven — set these as GitHub
+          # Secrets or repo variables instead of editing monitor.py directly.
+          MONITOR_REGION: ${{ vars.MONITOR_REGION }}
+          MONITOR_POU:    ${{ vars.MONITOR_POU }}
+          MONITOR_COURSE: ${{ vars.MONITOR_COURSE }}
         run: |
           if [ "${{ github.event.inputs.mode }}" = "debug" ]; then
             python monitor.py --debug
@@ -53,3 +63,37 @@ jobs:
           else
             python monitor.py
           fi
+
+      # FIX: notify admin if the workflow itself fails (scrape crash, import
+      # error, etc.). Without this step, silent failures go unnoticed for hours.
+      - name: Notify on workflow failure
+        if: failure()
+        env:
+          GMAIL_USER:     ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python - << 'PYEOF'
+          import os, smtplib
+          from email.mime.text import MIMEText
+          gmail_user = os.environ.get("GMAIL_USER")
+          gmail_pass = os.environ.get("GMAIL_APP_PASS")
+          alert_email = os.environ.get("ALERT_EMAIL")
+          if not (gmail_user and gmail_pass and alert_email):
+              print("Email credentials not set — skipping failure notification.")
+              exit(0)
+          msg = MIMEText(
+              "The ICAI Monitor GitHub Actions workflow FAILED.\n\n"
+              "Check the Actions log at:\n"
+              "https://github.com/${{ github.repository }}/actions\n\n"
+              "This means email alerts may not be sending. "
+              "The Railway Telegram bot is unaffected."
+          )
+          msg["Subject"] = "⚠️ ICAI Monitor Workflow Failed"
+          msg["From"]    = gmail_user
+          msg["To"]      = alert_email
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+              s.login(gmail_user, gmail_pass)
+              s.sendmail(gmail_user, alert_email, msg.as_string())
+          print("Failure notification sent.")
+          PYEOF
