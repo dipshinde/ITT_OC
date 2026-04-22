@@ -208,6 +208,21 @@ def main():
     # This keeps bot.py importable in tests without starting background threads.
     worker_thread = start_message_worker()
 
+    # Pre-warm SPOM states cache in background so the first user to tap SPOM
+    # doesn't have to wait for the portal AJAX call cold-start (~5–10 s).
+    def _spom_warmup():
+        try:
+            from spom_scraper import fetch_spom_states
+            states = fetch_spom_states()
+            if states:
+                logger.info(f"[Startup] SPOM states cache warmed: {len(states)} state(s)")
+            else:
+                logger.warning("[Startup] SPOM states cache warmup returned empty — portal may be unreachable from this IP")
+        except Exception as e:
+            logger.warning(f"[Startup] SPOM states warmup failed: {e}")
+
+    threading.Thread(target=_spom_warmup, name="SpomWarmup", daemon=True).start()
+
     # --- Start background services ---
     start_cleanup_scheduler(state)
 
