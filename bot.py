@@ -861,14 +861,16 @@ def ask_mode(chat_id: str, state: dict):
     """
     /start handler: reset any in-progress flow and show a mode-selection
     keyboard so users can choose between ITT/OC batch tracking and SPOM
-    exam-slot tracking.
+    exam-slot tracking. New users get a full intro; returning users get a
+    shorter welcome-back message.
     """
     u = state["users"].setdefault(chat_id, {})
+    is_new_user = not u.get("active") and not u.get("spom_watches") and not u.get("watchlist")
 
     # Reset any in-progress flows safely
     u.pop("pending",      None)
     u.pop("spom_pending", None)
-    u["processing"] = False
+    u["processing"]  = False
     u["mode_pending"] = True
     _save_user(chat_id, state)
 
@@ -876,15 +878,44 @@ def ask_mode(chat_id: str, state: dict):
         [("📚 ITT / OC Batches",   "mode:itt")],
         [("🧾 SPOM Exam Slots",    "mode:spom")],
     ])
-    send(
-        chat_id,
-        "👋 <b>Welcome to ICAI Monitor Bot!</b>\n\n"
-        "What would you like to track today?\n\n"
-        "📚 <b>ITT / OC Batches</b> — get alerts when ICAI batch seats open\n"
-        "🧾 <b>SPOM Exam Slots</b>  — get alerts when new exam dates appear\n\n"
-        "<i>You can run both trackers simultaneously.</i>",
-        markup,
-    )
+
+    if is_new_user:
+        send(
+            chat_id,
+            "👋 <b>Welcome to ICAI Monitor Bot!</b>\n\n"
+            "I help CA students get instant alerts so you never miss a batch or exam slot.\n\n"
+            "<b>──────────────────────────────────────────</b>\n"
+            "📚 <b>ITT / OC Batch Tracker</b>\n"
+            "  → Pick your Region, PoU, and Course\n"
+            "  → I'll alert you at <b>10 / 5 / 1</b> seats remaining\n"
+            "  → Use /watch anytime to add more\n\n"
+            "🧾 <b>SPOM Exam Slot Tracker</b>\n"
+            "  → Pick your State and City\n"
+            "  → I'll alert you the moment new green (available) dates appear\n"
+            "  → Use /spom to add more watches\n\n"
+            "<b>──────────────────────────────────────────</b>\n"
+            "⚙️ <b>Quick Commands</b>\n"
+            "  /watch      — add ITT/OC batch tracker\n"
+            "  /spom       — add SPOM slot tracker\n"
+            "  /status     — see your active batch watches\n"
+            "  /stop       — remove ITT/OC tracker\n"
+            "  /spomstop   — remove SPOM tracker\n"
+            "  /help       — full command guide\n\n"
+            "<i>✅ You can run ITT/OC and SPOM trackers at the same time.\n"
+            "Optionally add /email to also get email alerts.</i>\n\n"
+            "<b>What would you like to track today?</b>",
+            markup,
+        )
+    else:
+        send(
+            chat_id,
+            "👋 <b>Welcome back!</b>\n\n"
+            "What would you like to track?\n\n"
+            "📚 <b>ITT / OC Batches</b> — alerts when batch seats open\n"
+            "🧾 <b>SPOM Exam Slots</b>  — alerts when new exam dates appear\n\n"
+            "<i>Use /status to see your active watches, /help for all commands.</i>",
+            markup,
+        )
 
 
 # --- Command handlers ---------------------------------------------------------
@@ -1060,38 +1091,47 @@ def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
 def _send_help(chat_id: str):
     send(
         chat_id,
-        "<b>📖 ICAI Monitor Bot — Help &amp; Commands</b>\n\n"
-
-        "Use /start anytime to choose what you want to track.\n\n"
+        "📖 <b>ICAI Monitor Bot — Help Guide</b>\n\n"
+        "Use /start anytime to return to the main menu.\n\n"
 
         "<b>──────────────────────────────────────────</b>\n"
         "📚 <b>ITT / OC Batch Tracker</b>\n"
         "  /watch       — add a new ITT/OC batch to monitor\n"
-        "  /status      — see all your active batch watches\n"
+        "                 (choose Region → PoU → Course)\n"
+        "  /status      — list all your active batch watches\n"
         "  /stop        — remove one or all batch watches\n"
         "  /registered  — mark a batch as enrolled (stops alerts)\n\n"
+        "  <i>Alerts fire at 10, 5, and 1 seat remaining.</i>\n\n"
 
         "<b>──────────────────────────────────────────</b>\n"
         "🧾 <b>SPOM Exam Slot Tracker</b>\n"
-        "  /spom        — watch SPOM slots for a State + City\n"
+        "  /spom        — add a new SPOM watch (choose State → City)\n"
         "  /spomstop    — stop one or all SPOM watches\n\n"
+        "  <i>Alerts fire ONLY when new 🟢 available dates appear.\n"
+        "  No spam on seat count changes.</i>\n\n"
 
         "<b>──────────────────────────────────────────</b>\n"
         "📧 <b>Email Notifications</b>\n"
-        "  /email &lt;addr&gt;  — save your email for alerts\n"
+        "  /email &lt;addr&gt;  — save email for alerts\n"
         "                 e.g. <code>/email you@gmail.com</code>\n"
-        "  /emailoff      — disable email notifications\n\n"
+        "  /emailoff      — disable email (keeps address saved)\n\n"
+        "  <i>Email alerts work for both ITT/OC and SPOM.</i>\n\n"
 
         "<b>──────────────────────────────────────────</b>\n"
-        "⚙️ <b>Other Commands</b>\n"
-        "  /status      — view active ITT/OC trackers\n"
-        "  /stop        — remove ITT/OC tracker\n"
-        "  /spomstop    — remove SPOM tracker\n"
-        "  /help        — show this guide\n\n"
+        "⚙️ <b>All Commands at a Glance</b>\n"
+        "  /start      — main menu\n"
+        "  /watch      — add ITT/OC batch watch\n"
+        "  /spom       — add SPOM slot watch\n"
+        "  /status     — view active ITT/OC watches\n"
+        "  /stop       — remove ITT/OC watch\n"
+        "  /spomstop   — remove SPOM watch\n"
+        "  /registered — mark batch as enrolled\n"
+        "  /email      — set email for alerts\n"
+        "  /emailoff   — disable email alerts\n"
+        "  /help       — show this guide\n\n"
 
-        "<i>✅ You can run both ITT/OC and SPOM trackers at the same time.\n"
-        "Batch seat alerts fire at 10, 5, and 1 remaining seat.\n"
-        "SPOM alerts fire ONLY when new available (green) dates appear.</i>",
+        "<i>✅ ITT/OC and SPOM trackers run independently and simultaneously.\n"
+        "You can have multiple watches active at once.</i>",
     )
 
 
@@ -1221,13 +1261,18 @@ def start_spom_setup(chat_id: str, state: dict, message_id=None):
             return
 
         state["users"].setdefault(chat_id, {})
+        # FIX: fetch_spom_states() returns list[dict] with keys "label" and "value".
+        # Previous code did `{label: val for label, val in states}` which iterated
+        # over dict *keys* ("value", "label") instead of the actual data, causing
+        # every state button to render as "value" and all city lookups to fail.
+        state_tuples = [(item["label"], item["value"]) for item in states]
         state["users"][chat_id]["spom_pending"] = {
             "step":      "state",
-            "state_map": {label: val for label, val in states},
+            "state_map": {item["label"]: item["value"] for item in states},
         }
         _save_user(chat_id, state)
 
-        rows   = [states[i:i + 2] for i in range(0, len(states), 2)]
+        rows   = [state_tuples[i:i + 2] for i in range(0, len(state_tuples), 2)]
         markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
 
         existing_spom = state["users"][chat_id].get("spom_watches", [])
@@ -1287,15 +1332,17 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
                  "❌ Could not fetch city list for that state. Type /spom to try again.")
             return
 
+        # FIX: Same dict-vs-tuple bug as state_map — cities is list[dict].
+        city_tuples = [(item["label"], item["value"]) for item in cities]
         state["users"][chat_id]["spom_pending"] = {
             "step":        "city",
             "state_label": state_label,
             "state_value": state_value,
-            "city_map":    {label: val for label, val in cities},
+            "city_map":    {item["label"]: item["value"] for item in cities},
         }
         _save_user(chat_id, state)
 
-        rows   = [cities[i:i + 2] for i in range(0, len(cities), 2)]
+        rows   = [city_tuples[i:i + 2] for i in range(0, len(city_tuples), 2)]
         markup = ikb([[(label, f"spom_city:{label}") for label, _ in row] for row in rows])
         edit(chat_id, message_id,
              f"<b>Step 2 of 2 — Select your City</b>\n(State: {html.escape(state_label)})",
