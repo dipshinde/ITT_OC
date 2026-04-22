@@ -89,7 +89,7 @@ from spom_scraper import (
     compute_spom_hash, find_new_available_dates,
 )
 from db import (
-    load_state, save_state,
+    load_state, save_state, save_user, save_offset,
     load_batch_state, save_batch_state,
     load_spom_state, save_spom_state,
     record_heartbeat_ok, record_heartbeat_fail, get_heartbeat,
@@ -156,6 +156,22 @@ STATE_LOCK = threading.Lock()
 # same old batch_state, and users receive duplicate alerts.
 _SCRAPE_LOCK      = threading.Lock()
 _SPOM_SCRAPE_LOCK = threading.Lock()
+
+
+# ─── Granular save helper ─────────────────────────────────────────────────────
+
+def _save_user(chat_id: str, state: dict):
+    """
+    Persist only this user's document to MongoDB (Fix A — granular writes).
+
+    Replaces every bare _save_user(chat_id, state) call in handlers so that modifying
+    one user writes exactly ONE MongoDB document instead of rewriting the
+    entire users collection.  save_state() is now reserved for startup
+    migrations that genuinely need to bulk-update every user at once.
+    """
+    user_data = state["users"].get(chat_id)
+    if user_data is not None:
+        save_user(chat_id, user_data)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -592,7 +608,7 @@ def start_setup(chat_id: str, state: dict, message_id=None):
         return
 
     _set_processing(chat_id, state, True)
-    save_state(state)
+    _save_user(chat_id, state)
 
     loading_text = "⏳ <b>Fetching regions from ICAI portal...</b>\n\nThis takes a moment."
     if message_id:
@@ -611,7 +627,7 @@ def start_setup(chat_id: str, state: dict, message_id=None):
             regions = []
         finally:
             _set_processing(chat_id, state, False)
-            save_state(state)
+            _save_user(chat_id, state)
 
         if not regions:
             if bg_msg_id:
@@ -626,7 +642,7 @@ def start_setup(chat_id: str, state: dict, message_id=None):
             "step":       "region",
             "region_map": {label: val for label, val in regions},
         }
-        save_state(state)
+        _save_user(chat_id, state)
 
         rows   = [
             [regions[i], regions[i + 1]] if i + 1 < len(regions) else [regions[i]]
@@ -669,7 +685,7 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
         return
 
     _set_processing(chat_id, state, True)
-    save_state(state)
+    _save_user(chat_id, state)
 
     # FIX: show loading immediately — fetch_pous() makes 2 sequential HTTP
     # requests (~10-40 s) and must NOT block the polling thread.
@@ -684,7 +700,7 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
             pous = []
         finally:
             _set_processing(chat_id, state, False)
-            save_state(state)
+            _save_user(chat_id, state)
 
         if not pous:
             edit(chat_id, message_id,
@@ -697,7 +713,7 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
             "region_value": region_value,
             "pou_map":      {label: val for label, val in pous},
         }
-        save_state(state)
+        _save_user(chat_id, state)
 
         rows   = [[pous[i], pous[i + 1]] if i + 1 < len(pous) else [pous[i]] for i in range(0, len(pous), 2)]
         markup = ikb([[(label, f"pou:{label}") for label, _ in row] for row in rows])
@@ -854,7 +870,7 @@ def ask_mode(chat_id: str, state: dict):
     u.pop("spom_pending", None)
     u["processing"] = False
     u["mode_pending"] = True
-    save_state(state)
+    _save_user(chat_id, state)
 
     markup = ikb([
         [("📚 ITT / OC Batches",   "mode:itt")],
@@ -1009,7 +1025,7 @@ def _remove_registered_watch(chat_id: str, watch_idx: int, state: dict):
         u.pop("region", None)
         u.pop("pou",    None)
         u.pop("course", None)
-        save_state(state)
+        _save_user(chat_id, state)
     else:
         _delete_user(chat_id, state)
 
@@ -1127,7 +1143,7 @@ def _handle_email_command(chat_id: str, text: str, state: dict):
     u = state["users"].setdefault(chat_id, {})
     u["email"]         = email
     u["email_enabled"] = True
-    save_state(state)
+    _save_user(chat_id, state)
     set_user_email(chat_id, email, enabled=True)
 
     send(
@@ -1151,7 +1167,7 @@ def _handle_emailoff(chat_id: str, state: dict):
         return
 
     u["email_enabled"] = False
-    save_state(state)
+    _save_user(chat_id, state)
     set_user_email(chat_id, u["email"], enabled=False)
 
     send(
@@ -1176,7 +1192,7 @@ def start_spom_setup(chat_id: str, state: dict, message_id=None):
         return
 
     _set_processing(chat_id, state, True)
-    save_state(state)
+    _save_user(chat_id, state)
 
     loading_text = "⏳ <b>Fetching states from SPOM portal...</b>\n\nThis takes a moment."
     if message_id:
@@ -1194,7 +1210,7 @@ def start_spom_setup(chat_id: str, state: dict, message_id=None):
             states = []
         finally:
             _set_processing(chat_id, state, False)
-            save_state(state)
+            _save_user(chat_id, state)
 
         if not states:
             if bg_msg_id:
@@ -1209,7 +1225,7 @@ def start_spom_setup(chat_id: str, state: dict, message_id=None):
             "step":      "state",
             "state_map": {label: val for label, val in states},
         }
-        save_state(state)
+        _save_user(chat_id, state)
 
         rows   = [states[i:i + 2] for i in range(0, len(states), 2)]
         markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
@@ -1251,7 +1267,7 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
         return
 
     _set_processing(chat_id, state, True)
-    save_state(state)
+    _save_user(chat_id, state)
 
     edit(chat_id, message_id,
          "⏳ <b>Fetching cities for your state...</b>\n\nThis takes a moment.")
@@ -1264,7 +1280,7 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
             cities = []
         finally:
             _set_processing(chat_id, state, False)
-            save_state(state)
+            _save_user(chat_id, state)
 
         if not cities:
             edit(chat_id, message_id,
@@ -1277,7 +1293,7 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
             "state_value": state_value,
             "city_map":    {label: val for label, val in cities},
         }
-        save_state(state)
+        _save_user(chat_id, state)
 
         rows   = [cities[i:i + 2] for i in range(0, len(cities), 2)]
         markup = ikb([[(label, f"spom_city:{label}") for label, _ in row] for row in rows])
@@ -1318,7 +1334,7 @@ def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
             f"<b>{html.escape(city_label)}, {html.escape(state_label)}</b>.\n\n"
             f"Use /spomstop to remove it.",
         )
-        save_state(state)
+        _save_user(chat_id, state)
         return
 
     spom_watches.append({
@@ -1328,7 +1344,7 @@ def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
         "city_value":  city_value,
     })
     u["active"] = True
-    save_state(state)
+    _save_user(chat_id, state)
 
     email_note = ""
     if u.get("email_enabled") and u.get("email"):
@@ -1360,7 +1376,7 @@ def _handle_spomstop(chat_id: str, state: dict):
     if len(spom_watches) == 1:
         w = spom_watches[0]
         u["spom_watches"] = []
-        save_state(state)
+        _save_user(chat_id, state)
         send(
             chat_id,
             f"✅ Stopped watching SPOM slots for "
@@ -1398,14 +1414,14 @@ def handle_callback(cb: dict, state: dict):
         u = state["users"].setdefault(chat_id, {})
         u.pop("mode_pending", None)
         u["mode"] = "itt"
-        save_state(state)
+        _save_user(chat_id, state)
         start_setup(chat_id, state, message_id=message_id)
 
     elif data == "mode:spom":
         u = state["users"].setdefault(chat_id, {})
         u.pop("mode_pending", None)
         u["mode"] = "spom"
-        save_state(state)
+        _save_user(chat_id, state)
         start_spom_setup(chat_id, state, message_id=message_id)
 
     # ── Setup flow callbacks ──────────────────────────────────────────────────
@@ -1436,7 +1452,7 @@ def handle_callback(cb: dict, state: dict):
                         u.pop("region", None)
                         u.pop("pou",    None)
                         u.pop("course", None)
-                        save_state(state)
+                        _save_user(chat_id, state)
                         send(
                             chat_id,
                             f"✅ Stopped watching <b>{html.escape(removed.get('course', ''))}</b> "
@@ -1489,7 +1505,7 @@ def handle_callback(cb: dict, state: dict):
 
         if idx_str == "all":
             u["spom_watches"] = []
-            save_state(state)
+            _save_user(chat_id, state)
             send(chat_id, "All SPOM watches stopped. Use /spom anytime to add new ones.")
         else:
             try:
@@ -1497,7 +1513,7 @@ def handle_callback(cb: dict, state: dict):
                 if 0 <= idx < len(spom_watches):
                     removed = spom_watches.pop(idx)
                     u["spom_watches"] = spom_watches
-                    save_state(state)
+                    _save_user(chat_id, state)
                     send(
                         chat_id,
                         f"✅ Stopped watching SPOM slots for "
@@ -1518,10 +1534,17 @@ def process_updates(state: dict):
     """Fetch pending Telegram updates and dispatch to handlers."""
     offset = state.get("_offset", 0)
     try:
+        # FIX C: True long polling — Telegram holds the connection for up to 30 s
+        # and returns the moment an update arrives, so the bot reacts instantly.
+        # The previous timeout=5 was effectively short-polling: Telegram
+        # returned every 5 s regardless of whether any update had come in,
+        # causing a 0-5 s artificial lag on every message.
+        # requests timeout must exceed the Telegram timeout so we don't hit a
+        # spurious ReadTimeout before Telegram finishes its 30-second wait.
         resp = requests.get(
             f"{API_BASE}/getUpdates",
-            params={"offset": offset, "timeout": 5},
-            timeout=20,
+            params={"offset": offset, "timeout": 30},
+            timeout=35,
         )
         # FIX: check HTTP status before parsing. A 401 (bad token), 409
         # (webhook conflict), or 5xx returns a body without "result", so
