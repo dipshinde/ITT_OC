@@ -21,9 +21,13 @@ Required environment variables (set as GitHub Secrets):
 
 Optional:
   MONGODB_DB      → database name (default: icai_bot)
+  MONITOR_REGION  → region to watch (default: Western)
+  MONITOR_POU     → place of utilization (default: Pune)
+  MONITOR_COURSE  → course name (default: Advanced (ICITSS) MCS Course)
 """
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -37,12 +41,13 @@ logger = logging.getLogger(__name__)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                    YOUR PREFERENCES                              ║
-# ║  Edit these three values to match your requirements.             ║
+# ║  Set via environment variables, or edit defaults below.          ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-REGION = "Western"
-POU    = "Pune"
-COURSE = "Advanced (ICITSS) MCS Course"
+# FIX: Read from env vars so this file works for anyone, not just one person.
+REGION = os.environ.get("MONITOR_REGION", "Western")
+POU    = os.environ.get("MONITOR_POU",    "Pune")
+COURSE = os.environ.get("MONITOR_COURSE", "Advanced (ICITSS) MCS Course")
 
 # To monitor multiple combinations, add more dicts to this list:
 # WATCHLIST = [
@@ -61,7 +66,9 @@ def make_key(region: str, pou: str, course: str) -> str:
 
 def run_monitor():
     from scraper import scrape_batches, compute_hash
-    from notifier import send_alert
+    # FIX: was `from notifier import send_alert` — that function does not exist.
+    # The correct export is send_itt_oc_alert.
+    from notifier import send_itt_oc_alert
     from db import load_batch_state, save_batch_state
 
     # Load state from MongoDB — shared with the Railway Telegram bot
@@ -95,7 +102,7 @@ def run_monitor():
         if is_first and batches:
             logger.info(f"FIRST RUN — {len(batches)} batch(es) already listed, sending alert")
             try:
-                send_alert(batches, region, pou, course)
+                send_itt_oc_alert(batches, region, pou, course)
                 alerts_sent += 1
             except Exception as e:
                 logger.error(f"Failed to send alert: {e}")
@@ -107,7 +114,7 @@ def run_monitor():
         elif changed and not is_first:
             logger.info(f"CHANGE DETECTED for {key} — {len(batches)} batch(es)")
             try:
-                send_alert(batches, region, pou, course)
+                send_itt_oc_alert(batches, region, pou, course)
                 alerts_sent += 1
             except Exception as e:
                 logger.error(f"Failed to send alert: {e}")
