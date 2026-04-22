@@ -45,7 +45,7 @@ from bot import (
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL_SEC         = 2    # sleep between getUpdates calls (long-poll handles idle)
+POLL_INTERVAL_SEC         = 0    # sleep between getUpdates calls (long-poll handles idle)
 MONITOR_INTERVAL_SEC      = 60   # how often to scrape ITT/OC batches (1 min)
 SPOM_MONITOR_INTERVAL_SEC = 300  # how often to scrape SPOM slots (5 min)
 
