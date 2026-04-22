@@ -128,7 +128,7 @@ _SAFE_API_BASE = "https://api.telegram.org/bot[REDACTED]"
 def _redact(text: str) -> str:
     """Replace the bot token with [REDACTED] in any string before logging."""
     return text.replace(TOKEN, "[REDACTED]") if TOKEN else text
-ICAI_URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx&timeout=30""
+ICAI_URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx&timeout=30"
 ICAI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
 }
