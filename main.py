@@ -3,30 +3,25 @@ main.py
 -------
 Persistent entry point for the ICAI Telegram Bot.
 
-Runs two concurrent loops:
+Runs three concurrent loops:
   1. Telegram polling loop  — checks for user messages every 2 s
-  2. Background monitor     — scrapes ICAI and sends alerts every 60 s
+  2. Batch monitor          — scrapes ICAI ITT/OC batches every 60 s
+  3. SPOM monitor           — scrapes SPOM exam slots every 300 s (5 min)
 
 Deploy on Railway:
   Set start command to `python main.py`
 
-Changes from original
-─────────────────────
-  - State is loaded from MongoDB ONCE at startup and kept in memory.
-    The polling loop no longer hits MongoDB on every 2-second tick;
-    it saves only when a Telegram update is actually processed.
+Environment variables (set in Railway dashboard or .env):
+  Required:
+    TELEGRAM_BOT_TOKEN  — Telegram bot token
+    MONGODB_URI         — MongoDB connection string
 
-  - ensure_indexes() is called at startup to create MongoDB indexes
-    (safe to call repeatedly — skips existing indexes).
-
-  - _reset_stuck_processing() is called at startup to clear any
-    processing=True flags left from a previous crash or Railway restart,
-    preventing users from being permanently silenced.
-
-  - migrate_users_to_watchlist() is called at startup to convert any
-    existing single-watch user documents (old format with region/pou/course
-    at top level) to the new watchlist-array format required for multi-batch
-    tracking support.
+  Optional:
+    MONGODB_DB          — database name (default: icai_bot)
+    GMAIL_USER          — Gmail address for sending email alerts
+    GMAIL_APP_PASS      — 16-char Gmail App Password
+    ALERT_EMAIL         — fallback recipient for email alerts
+    ADMIN_CHAT_ID       — Telegram chat ID for heartbeat admin alerts
 """
 
 import logging
@@ -39,16 +34,24 @@ from db import ensure_indexes, load_state, save_state
 from bot import (
     process_updates,
     scrape_and_alert,
+    spom_scrape_and_alert,
     start_cleanup_scheduler,
+    start_message_worker,       # FIX: import explicit starter instead of relying on module-level side-effect
     STATE_LOCK,
+    _MSG_QUEUE,                 # FIX: needed to send shutdown sentinel to queue worker
     _reset_stuck_processing,
     migrate_users_to_watchlist,
 )
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL_SEC    = 2     # how often to check Telegram for new messages
-MONITOR_INTERVAL_SEC = 60    # how often to scrape ICAI (1 minute)
+POLL_INTERVAL_SEC         = 2    # sleep between getUpdates calls (long-poll handles idle)
+MONITOR_INTERVAL_SEC      = 60   # how often to scrape ITT/OC batches (1 min)
+SPOM_MONITOR_INTERVAL_SEC = 300  # how often to scrape SPOM slots (5 min)
+
+# FIX: give threads enough time to finish their current scrape cycle on shutdown.
+# scrape_and_alert can take up to 120 s (futures timeout) + buffer.
+THREAD_SHUTDOWN_TIMEOUT = 135
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,15 +73,15 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
 
-# ─── Background monitor thread ────────────────────────────────────────────────
+
+# ─── ITT / OC batch monitor thread ───────────────────────────────────────────
 
 def background_monitor(state: dict):
     """
-    Wakes up every MONITOR_INTERVAL_SEC, scrapes ICAI for every active
-    user, and sends Telegram alerts if batches changed or seat thresholds
-    were crossed. Runs immediately on first iteration.
+    Wakes up every MONITOR_INTERVAL_SEC and scrapes ICAI ITT/OC batches.
+    Sends Telegram + email alerts on structural changes or seat thresholds.
     """
-    logger.info("Background monitor started.")
+    logger.info("Batch monitor started.")
     first_run = True
 
     while not _shutdown.is_set():
@@ -96,9 +99,40 @@ def background_monitor(state: dict):
         try:
             scrape_and_alert(state)
         except Exception as e:
-            logger.error(f"Monitor cycle error: {e}", exc_info=True)
+            logger.error(f"Batch monitor cycle error: {e}", exc_info=True)
 
-    logger.info("Background monitor stopped.")
+    logger.info("Batch monitor stopped.")
+
+
+# ─── SPOM slot monitor thread ─────────────────────────────────────────────────
+
+def spom_monitor(state: dict):
+    """
+    Wakes up every SPOM_MONITOR_INTERVAL_SEC and checks SPOM portal for new
+    exam slot availability.  Alerts ONLY when new available (green) dates
+    appear in a subscribed city.  Sends both Telegram + email if configured.
+    """
+    logger.info("SPOM monitor started.")
+
+    # Offset first run by 30 s so it doesn't collide with the batch monitor start
+    for _ in range(30):
+        if _shutdown.is_set():
+            break
+        time.sleep(1)
+
+    while not _shutdown.is_set():
+        logger.info("─── SPOM monitor cycle starting ───")
+        try:
+            spom_scrape_and_alert(state)
+        except Exception as e:
+            logger.error(f"SPOM monitor cycle error: {e}", exc_info=True)
+
+        for _ in range(SPOM_MONITOR_INTERVAL_SEC):
+            if _shutdown.is_set():
+                break
+            time.sleep(1)
+
+    logger.info("SPOM monitor stopped.")
 
 
 # ─── Telegram polling loop ────────────────────────────────────────────────────
@@ -133,9 +167,9 @@ def telegram_polling_loop(state: dict):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    logger.info("╔══════════════════════════════════════════╗")
-    logger.info("║   ICAI Batch Monitor Bot — starting up   ║")
-    logger.info("╚══════════════════════════════════════════╝")
+    logger.info("╔══════════════════════════════════════════════════╗")
+    logger.info("║   ICAI Batch + SPOM Monitor Bot — starting up   ║")
+    logger.info("╚══════════════════════════════════════════════════╝")
 
     # --- DB setup ---
     logger.info("Ensuring MongoDB indexes...")
@@ -163,6 +197,10 @@ def main():
         with STATE_LOCK:
             save_state(state)
 
+    # FIX: Start queue worker explicitly here instead of at bot.py import time.
+    # This keeps bot.py importable in tests without starting background threads.
+    worker_thread = start_message_worker()
+
     # --- Start background services ---
     start_cleanup_scheduler(state)
 
@@ -174,11 +212,27 @@ def main():
     )
     monitor_thread.start()
 
+    spom_thread = threading.Thread(
+        target=spom_monitor,
+        args=(state,),
+        name="SpomMonitor",
+        daemon=True,
+    )
+    spom_thread.start()
+
     # --- Main loop (blocks until SIGTERM / Ctrl-C) ---
     telegram_polling_loop(state)
 
-    logger.info("Main thread exiting. Waiting for monitor thread...")
-    monitor_thread.join(timeout=10)
+    logger.info("Main thread exiting. Waiting for background threads...")
+    monitor_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+    spom_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
+
+    # FIX: Send sentinel to queue worker so it flushes remaining messages
+    # before the process exits, instead of being killed mid-send.
+    logger.info("Draining message queue...")
+    _MSG_QUEUE.put(None)
+    worker_thread.join(timeout=30)
+
     logger.info("Shutdown complete.")
     sys.exit(0)
 
