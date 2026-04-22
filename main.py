@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from db import ensure_indexes, load_state, save_state
+from db import ensure_indexes, load_state, save_state, save_offset
 from bot import (
     process_updates,
     scrape_and_alert,
@@ -140,7 +140,15 @@ def spom_monitor(state: dict):
 def telegram_polling_loop(state: dict):
     """
     Continuously polls Telegram for new messages / button taps.
-    Saves state to MongoDB only when updates were actually processed.
+
+    Fix A + Fix C: The polling loop only needs to persist the Telegram update
+    offset — user data is written granularly by each handler via _save_user().
+    Replacing save_state(state) here with save_offset() means each tick writes
+    exactly one tiny document instead of rewriting every user in the collection.
+
+    Fix C: process_updates() now uses long polling (timeout=30 in getUpdates),
+    so the loop blocks inside requests.get() for up to 30 s waiting for the
+    next update — no sleep() needed, and response latency drops to ~0 ms.
     """
     logger.info("Telegram polling loop started.")
 
@@ -150,16 +158,15 @@ def telegram_polling_loop(state: dict):
             process_updates(state)
 
             if state.get("_offset", 0) != offset_before:
-                with STATE_LOCK:
-                    save_state(state)
+                # Fix A: only persist the offset — handler already saved user data
+                save_offset(state["_offset"])
 
         except Exception as e:
             logger.error(f"Polling error: {e}", exc_info=True)
 
-        for _ in range(POLL_INTERVAL_SEC):
-            if _shutdown.is_set():
-                break
-            time.sleep(1)
+        # No sleep needed — long polling in process_updates() handles idle wait.
+        # POLL_INTERVAL_SEC is kept at 0 and the loop spins immediately into the
+        # next long-poll call.
 
     logger.info("Telegram polling loop stopped.")
 
