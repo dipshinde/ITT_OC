@@ -128,7 +128,7 @@ _SAFE_API_BASE = "https://api.telegram.org/bot[REDACTED]"
 def _redact(text: str) -> str:
     """Replace the bot token with [REDACTED] in any string before logging."""
     return text.replace(TOKEN, "[REDACTED]") if TOKEN else text
-ICAI_URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx&timeout=30"
+ICAI_URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx"
 ICAI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
 }
@@ -579,51 +579,78 @@ def fetch_pous(region_value: str):
 # --- Setup flow helpers -------------------------------------------------------
 
 def start_setup(chat_id: str, state: dict, message_id=None):
-    """Begin the Region -> PoU -> Course selection flow."""
+    """Begin the Region -> PoU -> Course selection flow.
+
+    FIX: fetch_regions() is a slow HTTP call (~2-20 s) that previously ran
+    synchronously on the Telegram polling thread, freezing the entire bot for
+    every user while one user's region list loaded.  Now we:
+      1. Show a "⏳ Loading..." message immediately (non-blocking)
+      2. Spawn a background thread to do the HTTP fetch
+      3. Edit the message with the real keyboard once fetch completes
+    """
     if _is_processing(chat_id, state):
         return
 
     _set_processing(chat_id, state, True)
     save_state(state)
 
-    try:
-        regions = fetch_regions()
-    finally:
-        _set_processing(chat_id, state, False)
+    loading_text = "⏳ <b>Fetching regions from ICAI portal...</b>\n\nThis takes a moment."
+    if message_id:
+        edit(chat_id, message_id, loading_text)
+        bg_msg_id = message_id
+    else:
+        # Use tg() (direct/synchronous) to get the message_id for later editing
+        resp = tg("sendMessage", chat_id=chat_id, text=loading_text, parse_mode="HTML")
+        bg_msg_id = (resp.get("result") or {}).get("message_id")
+
+    def _bg():
+        try:
+            regions = fetch_regions()
+        except Exception as e:
+            logger.error(f"fetch_regions failed: {e}")
+            regions = []
+        finally:
+            _set_processing(chat_id, state, False)
+            save_state(state)
+
+        if not regions:
+            if bg_msg_id:
+                edit(chat_id, bg_msg_id,
+                     "❌ Could not reach the ICAI site. Please try /watch again in a minute.")
+            else:
+                send(chat_id, "Could not reach the ICAI site. Please try again in a minute.")
+            return
+
+        state["users"].setdefault(chat_id, {})
+        state["users"][chat_id]["pending"] = {
+            "step":       "region",
+            "region_map": {label: val for label, val in regions},
+        }
         save_state(state)
 
-    if not regions:
-        send(chat_id, "Could not reach the ICAI site. Please try again in a minute.")
-        return
+        rows   = [
+            [regions[i], regions[i + 1]] if i + 1 < len(regions) else [regions[i]]
+            for i in range(0, len(regions), 2)
+        ]
+        markup = ikb([[(label, f"region:{label}") for label, _ in row] for row in rows])
 
-    state["users"].setdefault(chat_id, {})
-    state["users"][chat_id]["pending"] = {
-        "step":       "region",
-        "region_map": {label: val for label, val in regions},
-    }
+        existing = _get_watchlist(state["users"].get(chat_id, {}))
+        active_count = sum(1 for w in existing if not w.get("registered"))
+        if active_count > 0:
+            intro = (
+                f"You're already watching <b>{active_count}</b> batch(es). "
+                f"Let's add another one!\n\n"
+                f"<b>Step 1 of 3 — Select your Region:</b>"
+            )
+        else:
+            intro = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 — Select your Region:</b>"
 
-    rows   = [
-        [regions[i], regions[i + 1]] if i + 1 < len(regions) else [regions[i]]
-        for i in range(0, len(regions), 2)
-    ]
-    markup = ikb([[(label, f"region:{label}") for label, _ in row] for row in rows])
+        if bg_msg_id:
+            edit(chat_id, bg_msg_id, intro, markup)
+        else:
+            send(chat_id, intro, markup)
 
-    # Show different prompt if user already has watches
-    existing = _get_watchlist(state["users"].get(chat_id, {}))
-    active_count = sum(1 for w in existing if not w.get("registered"))
-    if active_count > 0:
-        intro = (
-            f"You're already watching <b>{active_count}</b> batch(es). "
-            f"Let's add another one!\n\n"
-            f"<b>Step 1 of 3 — Select your Region:</b>"
-        )
-    else:
-        intro = "Welcome! Let's set up your batch alert.\n\n<b>Step 1 of 3 — Select your Region:</b>"
-
-    if message_id:
-        edit(chat_id, message_id, intro, markup)
-    else:
-        send(chat_id, intro, markup)
+    threading.Thread(target=_bg, name=f"RegionFetch-{chat_id}", daemon=True).start()
 
 
 def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
@@ -643,28 +670,42 @@ def ask_pou(chat_id: str, region_label: str, state: dict, message_id: int):
 
     _set_processing(chat_id, state, True)
     save_state(state)
-    try:
-        pous = fetch_pous(region_value)
-    finally:
-        _set_processing(chat_id, state, False)
+
+    # FIX: show loading immediately — fetch_pous() makes 2 sequential HTTP
+    # requests (~10-40 s) and must NOT block the polling thread.
+    edit(chat_id, message_id,
+         "⏳ <b>Fetching cities for your region...</b>\n\nThis takes a moment.")
+
+    def _bg():
+        try:
+            pous = fetch_pous(region_value)
+        except Exception as e:
+            logger.error(f"fetch_pous failed: {e}")
+            pous = []
+        finally:
+            _set_processing(chat_id, state, False)
+            save_state(state)
+
+        if not pous:
+            edit(chat_id, message_id,
+                 "❌ Could not fetch city list. Type /watch to try again.")
+            return
+
+        state["users"][chat_id]["pending"] = {
+            "step":         "pou",
+            "region_label": region_label,
+            "region_value": region_value,
+            "pou_map":      {label: val for label, val in pous},
+        }
         save_state(state)
 
-    if not pous:
-        send(chat_id, "Could not fetch city list. Type /watch to try again.")
-        return
+        rows   = [[pous[i], pous[i + 1]] if i + 1 < len(pous) else [pous[i]] for i in range(0, len(pous), 2)]
+        markup = ikb([[(label, f"pou:{label}") for label, _ in row] for row in rows])
+        edit(chat_id, message_id,
+             f"<b>Step 2 of 3 — Select your City/PoU</b>\n(Region: {html.escape(region_label)})",
+             markup)
 
-    state["users"][chat_id]["pending"] = {
-        "step":         "pou",
-        "region_label": region_label,
-        "region_value": region_value,
-        "pou_map":      {label: val for label, val in pous},
-    }
-
-    rows   = [[pous[i], pous[i + 1]] if i + 1 < len(pous) else [pous[i]] for i in range(0, len(pous), 2)]
-    markup = ikb([[(label, f"pou:{label}") for label, _ in row] for row in rows])
-    edit(chat_id, message_id,
-         f"<b>Step 2 of 3 — Select your City/PoU</b>\n(Region: {html.escape(region_label)})",
-         markup)
+    threading.Thread(target=_bg, name=f"PouFetch-{chat_id}", daemon=True).start()
 
 
 def ask_course(chat_id: str, pou_label: str, state: dict, message_id: int):
@@ -1126,50 +1167,77 @@ def _handle_emailoff(chat_id: str, state: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def start_spom_setup(chat_id: str, state: dict, message_id=None):
-    """Begin SPOM watch setup: fetch states and show keyboard."""
+    """Begin SPOM watch setup: fetch states and show keyboard.
+
+    FIX: fetch_spom_states() is a slow AJAX call that must NOT block the
+    polling thread. Show loading immediately, then fetch in background.
+    """
     if _is_processing(chat_id, state):
         return
 
     _set_processing(chat_id, state, True)
     save_state(state)
-    try:
-        states = fetch_spom_states()
-    finally:
-        _set_processing(chat_id, state, False)
+
+    loading_text = "⏳ <b>Fetching states from SPOM portal...</b>\n\nThis takes a moment."
+    if message_id:
+        edit(chat_id, message_id, loading_text)
+        bg_msg_id = message_id
+    else:
+        resp = tg("sendMessage", chat_id=chat_id, text=loading_text, parse_mode="HTML")
+        bg_msg_id = (resp.get("result") or {}).get("message_id")
+
+    def _bg():
+        try:
+            states = fetch_spom_states()
+        except Exception as e:
+            logger.error(f"fetch_spom_states failed: {e}")
+            states = []
+        finally:
+            _set_processing(chat_id, state, False)
+            save_state(state)
+
+        if not states:
+            if bg_msg_id:
+                edit(chat_id, bg_msg_id,
+                     "❌ Could not reach the SPOM portal right now. Please try again in a minute.")
+            else:
+                send(chat_id, "Could not reach the SPOM portal right now. Please try again in a minute.")
+            return
+
+        state["users"].setdefault(chat_id, {})
+        state["users"][chat_id]["spom_pending"] = {
+            "step":      "state",
+            "state_map": {label: val for label, val in states},
+        }
         save_state(state)
 
-    if not states:
-        send(chat_id, "Could not reach the SPOM portal right now. Please try again in a minute.")
-        return
+        rows   = [states[i:i + 2] for i in range(0, len(states), 2)]
+        markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
 
-    state["users"].setdefault(chat_id, {})
-    state["users"][chat_id]["spom_pending"] = {
-        "step":      "state",
-        "state_map": {label: val for label, val in states},
-    }
-    save_state(state)
+        existing_spom = state["users"][chat_id].get("spom_watches", [])
+        if existing_spom:
+            intro = (
+                f"You already have <b>{len(existing_spom)}</b> SPOM watch(es). "
+                f"Adding another one!\n\n"
+                f"<b>Step 1 of 2 — Select your State:</b>"
+            )
+        else:
+            intro = "🗓️ <b>SPOM Slot Monitor Setup</b>\n\n<b>Step 1 of 2 — Select your State:</b>"
 
-    rows   = [states[i:i + 2] for i in range(0, len(states), 2)]
-    markup = ikb([[(label, f"spom_state:{label}") for label, _ in row] for row in rows])
+        if bg_msg_id:
+            edit(chat_id, bg_msg_id, intro, markup)
+        else:
+            send(chat_id, intro, markup)
 
-    existing_spom = state["users"][chat_id].get("spom_watches", [])
-    if existing_spom:
-        intro = (
-            f"You already have <b>{len(existing_spom)}</b> SPOM watch(es). "
-            f"Adding another one!\n\n"
-            f"<b>Step 1 of 2 — Select your State:</b>"
-        )
-    else:
-        intro = "🗓️ <b>SPOM Slot Monitor Setup</b>\n\n<b>Step 1 of 2 — Select your State:</b>"
-
-    if message_id:
-        edit(chat_id, message_id, intro, markup)
-    else:
-        send(chat_id, intro, markup)
+    threading.Thread(target=_bg, name=f"SpomStateFetch-{chat_id}", daemon=True).start()
 
 
 def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int):
-    """Second SPOM setup step: fetch cities and show keyboard."""
+    """Second SPOM setup step: fetch cities and show keyboard.
+
+    FIX: fetch_spom_cities() is a slow AJAX call — must NOT block the polling
+    thread. Show loading immediately, then fetch in background.
+    """
     if _is_processing(chat_id, state):
         answer_cb(message_id, "⏳ Still loading, please wait...")
         return
@@ -1184,29 +1252,40 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
 
     _set_processing(chat_id, state, True)
     save_state(state)
-    try:
-        cities = fetch_spom_cities(state_value)
-    finally:
-        _set_processing(chat_id, state, False)
+
+    edit(chat_id, message_id,
+         "⏳ <b>Fetching cities for your state...</b>\n\nThis takes a moment.")
+
+    def _bg():
+        try:
+            cities = fetch_spom_cities(state_value)
+        except Exception as e:
+            logger.error(f"fetch_spom_cities failed: {e}")
+            cities = []
+        finally:
+            _set_processing(chat_id, state, False)
+            save_state(state)
+
+        if not cities:
+            edit(chat_id, message_id,
+                 "❌ Could not fetch city list for that state. Type /spom to try again.")
+            return
+
+        state["users"][chat_id]["spom_pending"] = {
+            "step":        "city",
+            "state_label": state_label,
+            "state_value": state_value,
+            "city_map":    {label: val for label, val in cities},
+        }
         save_state(state)
 
-    if not cities:
-        send(chat_id, "Could not fetch city list for that state. Type /spom to try again.")
-        return
+        rows   = [cities[i:i + 2] for i in range(0, len(cities), 2)]
+        markup = ikb([[(label, f"spom_city:{label}") for label, _ in row] for row in rows])
+        edit(chat_id, message_id,
+             f"<b>Step 2 of 2 — Select your City</b>\n(State: {html.escape(state_label)})",
+             markup)
 
-    state["users"][chat_id]["spom_pending"] = {
-        "step":        "city",
-        "state_label": state_label,
-        "state_value": state_value,
-        "city_map":    {label: val for label, val in cities},
-    }
-    save_state(state)
-
-    rows   = [cities[i:i + 2] for i in range(0, len(cities), 2)]
-    markup = ikb([[(label, f"spom_city:{label}") for label, _ in row] for row in rows])
-    edit(chat_id, message_id,
-         f"<b>Step 2 of 2 — Select your City</b>\n(State: {html.escape(state_label)})",
-         markup)
+    threading.Thread(target=_bg, name=f"SpomCityFetch-{chat_id}", daemon=True).start()
 
 
 def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
