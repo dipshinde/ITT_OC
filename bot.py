@@ -2038,10 +2038,14 @@ def _spom_scrape_and_alert_impl(state: dict):
                     f"State : {_esc(state_label)}",
                     f"City  : {_esc(city_label)}\n"]
 
-        for centre, dates in new_dates_by_centre.items():
+        for centre, slots in new_dates_by_centre.items():
             tg_lines.append(f"<b>🏛️ {_esc(centre)}</b>")
-            for d in dates:
-                tg_lines.append(f"  ✅ {_esc(d)}")
+            for s in slots:
+                if isinstance(s, dict):
+                    seat_str = f"  ({s['seats']} seat{'s' if s['seats'] != 1 else ''})"
+                    tg_lines.append(f"  ✅ {_esc(s['date'])}{seat_str}")
+                else:
+                    tg_lines.append(f"  ✅ {_esc(s)}")
             tg_lines.append("")
 
         tg_lines.append(
