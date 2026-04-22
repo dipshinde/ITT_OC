@@ -130,7 +130,11 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     """
-    Persist user state to MongoDB.
+    Persist ALL user state to MongoDB in one bulk_write.
+
+    Use this ONLY at startup (migrations) or shutdown.
+    For runtime updates prefer save_user() or save_offset() — they write
+    exactly one document instead of the entire collection.
 
     FIX: Uses ReplaceOne instead of UpdateOne/$set so that fields removed
     from the in-memory dict (e.g. legacy region/pou/course after migration)
@@ -154,6 +158,44 @@ def save_state(state: dict):
             _users_col().bulk_write(ops, ordered=False)
     except PyMongoError as e:
         logger.error(f"save_state DB error: {e}")
+
+
+def save_user(chat_id: str, user_data: dict):
+    """
+    Granular single-user write — replaces only that user's MongoDB document.
+
+    Use this instead of save_state() whenever a handler modifies one user.
+    Writes exactly ONE document vs. N documents (one per user) for save_state,
+    cutting MongoDB write load proportionally to the number of active users.
+
+    ReplaceOne is used (not UpdateOne/$set) so stale/removed fields are
+    purged from the DB, exactly like save_state() does in its bulk path.
+    """
+    try:
+        _users_col().replace_one(
+            {"_id": chat_id},
+            {"_id": chat_id, **user_data},
+            upsert=True,
+        )
+    except PyMongoError as e:
+        logger.error(f"save_user DB error (chat_id={chat_id}): {e}")
+
+
+def save_offset(offset: int):
+    """
+    Persist only the Telegram update offset — one tiny $set, no user data touched.
+
+    Use in the polling loop instead of save_state() — the loop only needs to
+    persist the offset, not re-serialise every user document on every tick.
+    """
+    try:
+        _users_col().update_one(
+            {"_id": "__meta__"},
+            {"$set": {"offset": offset}},
+            upsert=True,
+        )
+    except PyMongoError as e:
+        logger.error(f"save_offset DB error: {e}")
 
 
 # ---------------------------------------------------------------------------
