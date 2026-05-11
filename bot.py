@@ -1373,6 +1373,78 @@ def _spom_ask_city(chat_id: str, state_label: str, state: dict, message_id: int)
     threading.Thread(target=_bg, name=f"SpomCityFetch-{chat_id}", daemon=True).start()
 
 
+def _spom_initial_scrape_notify(
+    chat_id: str, state_value: str, city_value: str,
+    state_label: str, city_label: str,
+):
+    """
+    Background thread: immediately scrape SPOM availability right after a user
+    subscribes and send them a snapshot of current slots.
+
+    Mirrors _initial_scrape_notify() for ITT/OC batches.
+    Always shows ALL currently available slots — NOT a diff — because this is
+    the user's first look at the data.
+    """
+    try:
+        centre_results = fetch_all_city_availability(state_value, city_value)
+
+        available_centres = [r for r in centre_results if r.get("available")]
+
+        if not centre_results:
+            send(
+                chat_id,
+                f"🔍 <b>No exam centres found</b> for <b>{html.escape(city_label)}</b>.\n\n"
+                f"I'll keep watching and alert you the moment slots open.",
+            )
+            return
+
+        if not available_centres:
+            # Centres exist but all are fully booked or have no dates
+            booked_count = sum(1 for r in centre_results if r.get("booked"))
+            send(
+                chat_id,
+                f"📋 <b>Current SPOM Slots — {html.escape(city_label)}, {html.escape(state_label)}</b>\n\n"
+                f"<b>{len(centre_results)}</b> centre(s) found — "
+                f"<b>no available (green) dates right now</b>.\n"
+                + (f"{booked_count} centre(s) have fully booked dates.\n" if booked_count else "")
+                + f"\nI'm watching continuously and will alert you the moment new slots open. 🔔",
+            )
+            return
+
+        # Build snapshot message of all currently available slots
+        lines = [
+            f"📋 <b>Current SPOM Slots — {html.escape(city_label)}, {html.escape(state_label)}</b>\n",
+        ]
+        total_slots = 0
+        for r in available_centres:
+            lines.append(f"<b>🏛️ {html.escape(r['centre'])}</b>")
+            for s in r["available"]:
+                if isinstance(s, dict):
+                    seat_str = f"  ({s['seats']} seat{'s' if s['seats'] != 1 else ''})"
+                    lines.append(f"  ✅ {html.escape(s['date'])}{seat_str}")
+                    total_slots += 1
+                else:
+                    lines.append(f"  ✅ {html.escape(s)}")
+                    total_slots += 1
+            lines.append("")
+
+        lines.append(
+            f"<b>{total_slots} slot(s) available right now.</b>\n\n"
+            f"<a href='https://spmt.icai.org/ICAI/LoginAction_showSlotDetails.action'>"
+            f"Book your slot now →</a>\n\n"
+            f"<i>I'll alert you when new (green) dates appear.</i>"
+        )
+        send(chat_id, "\n".join(lines))
+
+    except Exception as e:
+        logger.error(f"[SPOM] Initial scrape for {chat_id} failed: {e}", exc_info=True)
+        send(
+            chat_id,
+            "⚠️ Could not fetch current slot data right now, but I'm watching continuously.\n"
+            "You'll be alerted automatically when new slots appear.",
+        )
+
+
 def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
     """Final SPOM setup step: save the watch and clean up pending."""
     spom_pending = state["users"][chat_id].get("spom_pending", {})
@@ -1426,9 +1498,15 @@ def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
         f"City  : {html.escape(city_label)}\n\n"
         f"I'll alert you via Telegram{email_note} the moment "
         f"new exam slots open in your city.\n\n"
-        f"<i>ℹ️ Only newly available (green) dates trigger alerts.</i>\n"
-        f"Use /spomstop to remove this watch.",
+        f"⏳ Fetching current slot availability...",
     )
+
+    threading.Thread(
+        target=_spom_initial_scrape_notify,
+        args=(chat_id, state_value, city_value, state_label, city_label),
+        daemon=True,
+        name=f"SpomInitScrape-{chat_id}",
+    ).start()
 
 
 def _handle_spomstop(chat_id: str, state: dict):
