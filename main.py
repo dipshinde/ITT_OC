@@ -47,7 +47,7 @@ from bot import (
 
 POLL_INTERVAL_SEC         = 0    # sleep between getUpdates calls (long-poll handles idle)
 MONITOR_INTERVAL_SEC      = 60   # how often to scrape ITT/OC batches (1 min)
-SPOM_MONITOR_INTERVAL_SEC = 300  # how often to scrape SPOM slots (5 min)
+SPOM_MONITOR_INTERVAL_SEC = 60  # how often to scrape SPOM slots (1 min)
 
 # FIX: give threads enough time to finish their current scrape cycle on shutdown.
 # scrape_and_alert can take up to 120 s (futures timeout) + buffer.
