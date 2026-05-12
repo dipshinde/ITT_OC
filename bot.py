@@ -7,7 +7,7 @@ Responsibilities:
   - User onboarding flow: Region -> PoU -> Course (inline keyboard)
   - Command handling: /start /watch /status /stop /registered /help
   - scrape_and_alert(): called by background monitor thread every 60 s
-  - Seat-threshold alerts: notifies at 10 / 5 / 1 seats remaining
+  - Seat-threshold alerts: priority alerts at 5 / 1 seats remaining; also alerts on any seat count change
   - State persistence: MongoDB via db.py
 
 Fixes applied
@@ -24,8 +24,8 @@ Fixes applied
                             no longer triggers a change alert. Seat-count
                             alerts only fire at the configured thresholds.
 
-  3. SEAT THRESHOLDS     — changed from [15, 10, 5, 1] to [10, 5, 1].
-                            Alert at 15 seats removed per product decision.
+  3. SEAT THRESHOLDS     — priority threshold alerts at [5, 1]; any seat count
+                           change now also fires an alert (see any_changed logic).
 
   4. ZERO-SEAT GUARD     — _new_threshold_fires() now returns [] when
                             seats <= 0, preventing notifications for batches
@@ -137,8 +137,9 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
 HEARTBEAT_FAIL_THRESHOLD = 3
 
-# FIX: removed 15 from thresholds per product decision; alert only at 10, 5, 1
-SEAT_THRESHOLDS = [10, 5, 1]
+# Threshold alerts fire at 5 and 1 seat remaining.
+# Seat count changes above these thresholds are covered by the any-change alert.
+SEAT_THRESHOLDS = [5, 1]
 
 COURSES = [
     "Advanced (ICITSS) MCS Course",
@@ -746,11 +747,41 @@ def ask_course(chat_id: str, pou_label: str, state: dict, message_id: int):
 
 def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, course: str):
     """
-    Background thread: fetch current batches right after a user subscribes
-    and send them an immediate snapshot.
+    Background thread: fetch current batches right after a user subscribes,
+    send an immediate snapshot, and — critically — save the result as the
+    baseline state so the periodic monitor does NOT re-alert on the next tick.
+
+    Without the save_batch_state call the periodic scrape_and_alert sees
+    is_first=True for this key and fires a duplicate alert 60 s later.
     """
     try:
         batches = scrape_batches(region_label, pou_label, course)
+
+        # ── Save baseline immediately ─────────────────────────────────────────
+        # Must happen regardless of whether batches were found so the periodic
+        # monitor knows this key has already been initialised.
+        key = _make_key(region_label, pou_label, course)
+        try:
+            existing_state = load_batch_state()
+            # Only write the baseline if no state exists yet — avoids clobbering
+            # seat_alerts_sent that the periodic monitor may have just written.
+            if key not in existing_state:
+                baseline = {
+                    "hash":             compute_hash(batches),
+                    "struct_hash":      compute_structural_hash(batches),
+                    "batches":          batches,
+                    "last_checked":     datetime.now(timezone.utc).isoformat(),
+                    "region":           region_label,
+                    "pou":              pou_label,
+                    "course":           course,
+                    "seat_alerts_sent": {},
+                }
+                save_batch_state({key: baseline})
+                logger.info(f"[InitScrape] Baseline saved for {key} ({len(batches)} batch(es))")
+        except Exception as save_err:
+            logger.error(f"[InitScrape] Failed to save baseline for {key}: {save_err}")
+
+        # ── Notify user ───────────────────────────────────────────────────────
         if batches:
             body = format_batches(batches)
             send(
@@ -760,16 +791,16 @@ def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, cour
                 f"{body}\n\n"
                 f"<a href='https://www.icaionlineregistration.org/launchbatchdetail.aspx'>"
                 f"Register on ICAI portal</a>\n\n"
-                f"I'm monitoring continuously and will alert you when seats drop to "
-                f"<b>10, 5, and 1</b>.\n"
+                f"I'm monitoring continuously. You'll be alerted when seat counts change, "
+                f"and with priority alerts at <b>5 and 1</b> seats remaining.\n"
                 f"Once you've registered, send /registered so I stop notifying you.",
             )
         else:
             send(
                 chat_id,
                 f"<b>No batches listed yet</b> for {html.escape(course)} in {html.escape(pou_label)}.\n\n"
-                f"I'm monitoring continuously — you'll be alerted the moment batches appear, "
-                f"and again at <b>10, 5, and 1</b> seats remaining.\n\n"
+                f"I'm monitoring continuously — you'll be alerted the moment batches appear "
+                f"and whenever seat counts change. Priority alerts fire at <b>5 and 1</b> seats.\n\n"
                 f"Once you've registered, send /registered.",
             )
     except Exception as e:
@@ -777,7 +808,7 @@ def _initial_scrape_notify(chat_id: str, region_label: str, pou_label: str, cour
         send(
             chat_id,
             "Could not fetch current batch data right now, but I'm watching continuously.\n"
-            "You'll be alerted automatically when batches appear or seats hit 10, 5, or 1.",
+            "You'll be alerted automatically when batches appear or seat counts change.",
         )
 
 
@@ -887,7 +918,7 @@ def ask_mode(chat_id: str, state: dict):
             "<b>──────────────────────────────────────────</b>\n"
             "📚 <b>ITT / OC Batch Tracker</b>\n"
             "  → Pick your Region, PoU, and Course\n"
-            "  → I'll alert you at <b>10 / 5 / 1</b> seats remaining\n"
+            "  → I'll alert you on seat count changes + priority alerts at <b>5 / 1</b> seats\n"
             "  → Use /watch anytime to add more\n\n"
             "🧾 <b>SPOM Exam Slot Tracker</b>\n"
             "  → Pick your State and City\n"
@@ -947,7 +978,7 @@ def handle_message(msg: dict, state: dict):
                 chat_id,
                 f"<b>Currently watching {len(active_watches)} batch(es):</b>\n\n"
                 f"{lines}\n\n"
-                f"Alerts fire at <b>10 / 5 / 1</b> seats remaining.\n"
+                f"Alerts fire when seat counts change, and with priority alerts at <b>5 and 1</b> seats remaining.\n"
                 f"Use /watch to add more, /stop to remove one, "
                 f"or /registered once you've enrolled.",
             )
@@ -994,7 +1025,11 @@ def handle_message(msg: dict, state: dict):
         _handle_spomstop(chat_id, state)
 
     elif text.lower().startswith("/spom"):
-        start_spom_setup(chat_id, state)
+        u = state["users"].get(chat_id, {})
+        if u.get("spom_watches"):
+            _spom_show_current(chat_id, u, state)
+        else:
+            start_spom_setup(chat_id, state)
 
     else:
         send(chat_id, "Use /watch to set up a batch alert, /spom for exam slots, or /help for all commands.")
@@ -1101,7 +1136,7 @@ def _send_help(chat_id: str):
         "  /status      — list all your active batch watches\n"
         "  /stop        — remove one or all batch watches\n"
         "  /registered  — mark a batch as enrolled (stops alerts)\n\n"
-        "  <i>Alerts fire at 10, 5, and 1 seat remaining.</i>\n\n"
+        "  <i>Alerts fire on any seat count change, with priority alerts at 5 and 1 seat remaining.</i>\n\n"
 
         "<b>──────────────────────────────────────────</b>\n"
         "🧾 <b>SPOM Exam Slot Tracker</b>\n"
@@ -1379,15 +1414,47 @@ def _spom_initial_scrape_notify(
 ):
     """
     Background thread: immediately scrape SPOM availability right after a user
-    subscribes and send them a snapshot of current slots.
+    subscribes, send them a snapshot of current slots, and save the result as
+    the baseline state so the periodic monitor does NOT re-alert next tick.
 
-    Mirrors _initial_scrape_notify() for ITT/OC batches.
-    Always shows ALL currently available slots — NOT a diff — because this is
-    the user's first look at the data.
+    Without the save_spom_state call, spom_scrape_and_alert sees no persisted
+    state for this city and treats every currently-available date as "new",
+    firing a duplicate alert within 5 minutes of signup.
     """
     try:
         centre_results = fetch_all_city_availability(state_value, city_value)
 
+        # ── Save baseline immediately ─────────────────────────────────────────
+        if centre_results:
+            try:
+                existing_spom = load_spom_state()
+                any_missing = any(
+                    f"{state_value}|{city_value}|{r['centre']}" not in existing_spom
+                    for r in centre_results
+                )
+                if any_missing:
+                    updates = {}
+                    for r in centre_results:
+                        centre_key = f"{state_value}|{city_value}|{r['centre']}"
+                        if centre_key not in existing_spom:
+                            updates[centre_key] = {
+                                "available_dates": r.get("available", []),
+                                "booked_dates":    r.get("booked", []),
+                                "hash":            compute_spom_hash(centre_results),
+                                "state_label":     state_label,
+                                "city_label":      city_label,
+                                "centre_label":    r["centre"],
+                            }
+                    if updates:
+                        save_spom_state(updates)
+                        logger.info(
+                            f"[SpomInitScrape] Baseline saved for {city_label}, "
+                            f"{state_label} ({len(updates)} centre(s))"
+                        )
+            except Exception as save_err:
+                logger.error(f"[SpomInitScrape] Failed to save baseline: {save_err}")
+
+        # ── Notify user ───────────────────────────────────────────────────────
         available_centres = [r for r in centre_results if r.get("available")]
 
         if not centre_results:
@@ -1507,6 +1574,82 @@ def _spom_confirm(chat_id: str, city_label: str, state: dict, message_id: int):
         daemon=True,
         name=f"SpomInitScrape-{chat_id}",
     ).start()
+
+
+def _spom_show_current(chat_id: str, u: dict, state: dict):
+    """
+    Fetch and display current SPOM slot availability for all of the user's
+    existing watches. Runs the scrape in a background thread so the polling
+    loop is never blocked.
+
+    Called when a user who already has SPOM watches types /spom.
+    """
+    spom_watches = u.get("spom_watches", [])
+
+    send(chat_id, f"⏳ Fetching current SPOM slots for your {len(spom_watches)} watch(es)...")
+
+    def _bg():
+        for w in spom_watches:
+            state_value = w.get("state_value", "")
+            city_value  = w.get("city_value",  "")
+            state_label = w.get("state_label", state_value)
+            city_label  = w.get("city_label",  city_value)
+
+            try:
+                centre_results    = fetch_all_city_availability(state_value, city_value)
+                available_centres = [r for r in centre_results if r.get("available")]
+
+                if not centre_results:
+                    send(
+                        chat_id,
+                        f"🔍 <b>No centres found</b> — {html.escape(city_label)}, "
+                        f"{html.escape(state_label)}",
+                    )
+                    continue
+
+                if not available_centres:
+                    booked_count = sum(1 for r in centre_results if r.get("booked"))
+                    send(
+                        chat_id,
+                        f"📋 <b>SPOM Slots — {html.escape(city_label)}, {html.escape(state_label)}</b>\n\n"
+                        f"<b>{len(centre_results)}</b> centre(s) found — "
+                        f"<b>no available (green) dates right now</b>.\n"
+                        + (f"{booked_count} centre(s) fully booked.\n" if booked_count else "")
+                        + f"\nI'll alert you the moment new slots open. 🔔",
+                    )
+                    continue
+
+                lines = [
+                    f"📋 <b>SPOM Slots — {html.escape(city_label)}, {html.escape(state_label)}</b>\n"
+                ]
+                total_slots = 0
+                for r in available_centres:
+                    lines.append(f"<b>🏛️ {html.escape(r['centre'])}</b>")
+                    for s in r["available"]:
+                        if isinstance(s, dict):
+                            seat_str = f"  ({s['seats']} seat{'s' if s['seats'] != 1 else ''})"
+                            lines.append(f"  ✅ {html.escape(s['date'])}{seat_str}")
+                        else:
+                            lines.append(f"  ✅ {html.escape(s)}")
+                        total_slots += 1
+                    lines.append("")
+
+                lines.append(
+                    f"<b>{total_slots} slot(s) available right now.</b>\n\n"
+                    f"<a href='https://spmt.icai.org/ICAI/LoginAction_showSlotDetails.action'>"
+                    f"Book your slot now →</a>"
+                )
+                send(chat_id, "\n".join(lines))
+
+            except Exception as e:
+                logger.error(f"[SpomShowCurrent] Failed for {city_label}: {e}", exc_info=True)
+                send(
+                    chat_id,
+                    f"⚠️ Could not fetch slots for <b>{html.escape(city_label)}</b> right now. "
+                    f"Try again in a moment.",
+                )
+
+    threading.Thread(target=_bg, name=f"SpomShowCurrent-{chat_id}", daemon=True).start()
 
 
 def _handle_spomstop(chat_id: str, state: dict):
@@ -1760,7 +1903,8 @@ def _new_threshold_fires(batch: dict, already_sent: list) -> list:
     Return the subset of SEAT_THRESHOLDS that should fire for this batch.
 
     FIX: returns [] when seats <= 0 — prevents zero-seat notifications.
-    FIX: SEAT_THRESHOLDS is now [10, 5, 1] — removed the 15-seat alert.
+    Thresholds are [5, 1]; seat count changes above 5 are covered by the
+    any-change alert in scrape_and_alert.
     """
     seats = _seats_int(batch)
     if seats is None or seats <= 0:   # guard: never alert on 0 or negative seats
@@ -1895,7 +2039,9 @@ def _scrape_and_alert_impl(state: dict):
 
         # First run if we've never stored state for this key
         is_first = not old_entry
-        # FIX: only flag as "changed" when the STRUCTURE changed, not seat counts
+        # Alert on ANY change — structural (new batches, dates) OR seat counts.
+        # struct_changed is kept separately only to pick the right alert header.
+        any_changed    = (new_hash != old_hash)
         struct_changed = (new_struct_hash != old_struct_hash)
 
         # Prune seat_alerts_sent for batches that no longer exist
@@ -1910,7 +2056,7 @@ def _scrape_and_alert_impl(state: dict):
         for b in batches:
             batch_no = str(b.get("Batch No", b.get("BatchNo", "unknown")))
             already  = seat_alerts_sent.get(batch_no, [])
-            fires    = _new_threshold_fires(b, already)  # FIX: guards 0-seat & uses [10,5,1]
+            fires    = _new_threshold_fires(b, already)  # guards 0-seat; thresholds [5, 1]
             if fires:
                 seats  = _seats_int(b)
                 from_d = b.get("From Date", b.get("FromDate", ""))
@@ -1934,8 +2080,10 @@ def _scrape_and_alert_impl(state: dict):
             "seat_alerts_sent": seat_alerts_sent,
         }
 
-        # ── Change-based notifications (structural changes only) ──────────────
-        if struct_changed or is_first:
+        # ── Change-based notifications ────────────────────────────────────────
+        # Fires on: structural changes (new batches, dates, timing) AND seat
+        # count changes.  struct_changed drives the message header only.
+        if any_changed or is_first:
             added_batch_nos    = new_batch_nos - old_batch_nos
             newly_added        = [b for b in batches if b.get("Batch No", "") in added_batch_nos]
             batches_with_seats = [
@@ -1946,15 +2094,20 @@ def _scrape_and_alert_impl(state: dict):
             if is_first and not batches:
                 logger.info(f"  First run — no batches yet, baseline saved ({key})")
             else:
-                if batches_with_seats:
-                    header = "🔔 <b>ICAI Batch Update — Seats Available!</b>"
-                    body   = format_batches(batches_with_seats)
-                elif newly_added:
-                    header = "🔔 <b>New ICAI Batches Added</b> (no seats open yet)"
-                    body   = format_batches(newly_added)
+                if struct_changed:
+                    if batches_with_seats:
+                        header = "🔔 <b>ICAI Batch Update — Seats Available!</b>"
+                        body   = format_batches(batches_with_seats)
+                    elif newly_added:
+                        header = "🔔 <b>New ICAI Batches Added</b> (no seats open yet)"
+                        body   = format_batches(newly_added)
+                    else:
+                        header = "🔔 <b>ICAI Batch Update</b>"
+                        body   = format_batches(batches)
                 else:
-                    header = "🔔 <b>ICAI Batch Update</b>"
-                    body   = format_batches(batches)
+                    # Seat count changed, structure is identical
+                    header = "📊 <b>ICAI Batch Update — Seat Count Changed</b>"
+                    body   = format_batches(batches_with_seats or batches)
 
                 change_msg = (
                     f"{header}\n\n"
@@ -1965,7 +2118,8 @@ def _scrape_and_alert_impl(state: dict):
                     f"Register on ICAI portal →</a>\n\n"
                     f"Send /registered once you've enrolled."
                 )
-                logger.info(f"  Alerting {len(chat_ids)} user(s) — structural change detected ({key})")
+                change_type = "structural change" if struct_changed else "seat count change"
+                logger.info(f"  Alerting {len(chat_ids)} user(s) — {change_type} detected ({key})")
                 for chat_id in chat_ids:
                     send(chat_id, change_msg)
                     # ── Email notification ────────────────────────────────────
@@ -1984,7 +2138,7 @@ def _scrape_and_alert_impl(state: dict):
                                 f"  Email send failed for {chat_id}: {email_err}"
                             )
         else:
-            logger.info(f"  No structural change ({len(batches)} batch(es)) — {key}")
+            logger.info(f"  No change ({len(batches)} batch(es)) — {key}")
 
         # ── Seat-threshold notifications ──────────────────────────────────────
         if threshold_msgs:
